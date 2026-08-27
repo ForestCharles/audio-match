@@ -259,6 +259,19 @@ class Database:
                  + ",".join("?" * len(part)) + ")")
             yield from self.conn.execute(q, part)
 
+    def db_bytes(self) -> int:
+        """On-disk size, WAL included (and checkpointed first so it is real)."""
+        try:
+            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass
+        total = 0
+        for suffix in ("", "-wal", "-shm"):
+            p = self.path + suffix
+            if os.path.exists(p):
+                total += os.path.getsize(p)
+        return total
+
     def stats(self) -> dict[str, int]:
         c = self.conn
         def one(sql: str, *a) -> int:
@@ -275,8 +288,7 @@ class Database:
             "seconds": int(one(
                 "SELECT CAST(COALESCE(SUM(duration),0) AS INTEGER) "
                 "FROM files WHERE alive=1 AND status='ok'")),
-            "bytes": os.path.getsize(self.path)
-            if os.path.exists(self.path) else 0,
+            "bytes": self.db_bytes(),
         }
 
     def purge(self) -> tuple[int, int]:

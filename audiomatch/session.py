@@ -138,7 +138,7 @@ class Signature:
         n50 = len(config.HUM_50_HARMONICS)
         e50 = float(np.clip(self.hum[:n50], 0, None).sum())
         e60 = float(np.clip(self.hum[n50:], 0, None).sum())
-        if max(e50, e60) < 6.0:
+        if max(e50, e60) < config.HUM_PRESENCE_DB:
             return None
         return 50 if e50 >= e60 else 60
 
@@ -172,7 +172,13 @@ def _stft_mag(mono: np.ndarray, nfft: int, hop: int) -> np.ndarray:
 
 
 def _hum_profile(mono: np.ndarray, rate: int) -> np.ndarray:
-    """dB prominence of mains harmonics over the local spectral background."""
+    """dB prominence of mains harmonics over the local spectral background.
+
+    The spectrum is estimated *per frequency bin* as a low percentile across
+    many long chunks.  Mains hum is a stationary line: it is present in every
+    chunk, so it survives the percentile.  Music is transient, so it does not.
+    Taking the "quietest chunk" instead would still be mostly music.
+    """
     nfft = config.HUM_NFFT
     out = np.zeros(config.HUM_DIM, dtype=np.float32)
     if mono.size < nfft:
@@ -180,17 +186,16 @@ def _hum_profile(mono: np.ndarray, rate: int) -> np.ndarray:
         if nfft < 4096:
             return out
 
-    # Pick the quietest non-overlapping chunks -- hum is easiest to see when
-    # the performance is not on top of it.
     n_chunks = mono.size // nfft
     if n_chunks == 0:
         return out
     trimmed = mono[:n_chunks * nfft].reshape(n_chunks, nfft)
-    energy = (trimmed.astype(np.float64) ** 2).mean(axis=1)
-    order = np.argsort(energy, kind="stable")[:max(1, min(3, n_chunks))]
     win = np.hanning(nfft).astype(np.float32)
-    mag = np.mean([np.abs(np.fft.rfft(trimmed[i] * win))
-                   for i in order], axis=0)
+    spectra = np.abs(np.fft.rfft(trimmed * win, axis=1))
+    if n_chunks >= 4:
+        mag = np.percentile(spectra, config.HUM_PERCENTILE, axis=0)
+    else:
+        mag = spectra.min(axis=0)
 
     hz_per_bin = rate / nfft
     bg_half = max(3, int(round(config.HUM_BACKGROUND_HZ / hz_per_bin)))
@@ -235,6 +240,10 @@ def _channel_stats(stereo: np.ndarray, quiet_slices: np.ndarray) -> np.ndarray:
     near_identical = out[1] > 0.9995 and abs(float(out[0])) < 0.1
     silent_side = rms_l < 1e-6 or rms_r < 1e-6
     out[3] = 1.0 if (near_identical or silent_side) else 0.0
+
+    # DC offset in parts-per-million of full scale.
+    out[4] = float(left.mean()) * 1e6
+    out[5] = float(right.mean()) * 1e6
     return out
 
 
@@ -255,19 +264,24 @@ def signature_from_regions(stereo: np.ndarray, *, rate: int,
     quiet_sample_idx = np.zeros(0, dtype=np.int64)
 
     if mag.shape[0] >= 4:
-        energy = (mag.astype(np.float64) ** 2).sum(axis=1)
-        k = max(4, int(round(mag.shape[0] * config.SESSION_QUIET_FRACTION)))
-        k = min(k, mag.shape[0])
-        quiet = np.argsort(energy, kind="stable")[:k]
-        # Average in the log domain: robust to a single loud outlier frame.
-        avg = 20.0 * np.log10(mag[quiet] + _EPS)
-        band = _log_band_spectrum(
-            np.power(10.0, avg.mean(axis=0) / 20.0),
-            rate, config.SESSION_NFFT)
+        # Noise floor, estimated *per frequency bin* as a low percentile over
+        # time.  This is the classic minimum-statistics estimator: whatever is
+        # present in the quietest moments of every bin is the room + preamp +
+        # converter, not the performance.  Averaging whole quiet frames (the
+        # obvious alternative) still measures music, because in 150 s of
+        # continuous playing there are no genuinely silent frames.
+        floor = np.percentile(mag, config.SESSION_FLOOR_PERCENTILE, axis=0)
+        band = _log_band_spectrum(floor, rate, config.SESSION_NFFT)
         band = band - band.mean()
         norm = float(np.linalg.norm(band))
         sig.noise = (band / norm).astype(np.float32) if norm > _EPS else band
 
+        # Quiet *frames* are still the right sample set for the per-channel
+        # noise-floor comparison, which is a like-for-like L vs R measurement.
+        energy = (mag.astype(np.float64) ** 2).sum(axis=1)
+        k = max(4, int(round(mag.shape[0] * config.SESSION_QUIET_FRACTION)))
+        k = min(k, mag.shape[0])
+        quiet = np.argsort(energy, kind="stable")[:k]
         starts = quiet * config.SESSION_HOP
         quiet_sample_idx = np.concatenate(
             [np.arange(s, min(s + config.SESSION_NFFT, mono.size))
@@ -300,7 +314,8 @@ class SessionScore:
     notes: list[str] = field(default_factory=list)
 
 
-def compare(seed: Signature, other: Signature) -> SessionScore:
+def compare(seed: Signature, other: Signature, *,
+            ignore_filenames: bool = False) -> SessionScore:
     """Weighted session similarity in [0, 1], with a per-component breakdown."""
     # (a) Noise-floor spectrum shape.  Both vectors are mean-removed and
     # L2-normalised, so this is gain-invariant.  Mapped from [-1,1] to [0,1].
@@ -309,9 +324,10 @@ def compare(seed: Signature, other: Signature) -> SessionScore:
     # (b) Hum harmonic profile.  Only positive prominences carry information.
     hs = np.clip(seed.hum, 0.0, None)
     ho = np.clip(other.hum, 0.0, None)
-    if float(hs.sum()) < 3.0 and float(ho.sum()) < 3.0:
+    gate = config.HUM_PRESENCE_DB
+    if float(hs.sum()) < gate and float(ho.sum()) < gate:
         hum = 0.5                      # neither has hum: uninformative
-    elif float(hs.sum()) < 3.0 or float(ho.sum()) < 3.0:
+    elif float(hs.sum()) < gate or float(ho.sum()) < gate:
         hum = 0.2                      # one hums, the other does not
     else:
         hum = max(0.0, _cosine(hs, ho))
@@ -321,26 +337,41 @@ def compare(seed: Signature, other: Signature) -> SessionScore:
     d_cor = abs(float(seed.chan[1]) - float(other.chan[1]))
     d_nf = abs(float(seed.chan[2]) - float(other.chan[2]))
     same_mono = 1.0 - abs(float(seed.chan[3]) - float(other.chan[3]))
-    chan = (0.30 * math.exp(-d_bal / 6.0)
-            + 0.25 * max(0.0, 1.0 - d_cor / 1.2)
-            + 0.30 * math.exp(-d_nf / 6.0)
-            + 0.15 * same_mono)
+    d_dc = 0.5 * (abs(float(seed.chan[4]) - float(other.chan[4]))
+                  + abs(float(seed.chan[5]) - float(other.chan[5])))
+    chan = (0.20 * math.exp(-d_bal / 6.0)
+            + 0.15 * max(0.0, 1.0 - d_cor / 1.2)
+            + 0.20 * math.exp(-d_nf / 6.0)
+            + 0.10 * same_mono
+            + 0.35 * math.exp(-d_dc / config.DC_TOLERANCE_PPM))
 
-    # (d) Container facts.  A recorder writes one format for a whole session.
-    container = 0.0
-    container += 0.45 if seed.sample_rate == other.sample_rate else 0.0
-    container += 0.25 if seed.channels == other.channels else 0.0
-    container += 0.20 if seed.bits == other.bits else 0.0
-    container += 0.10 if (seed.role is not None) == (other.role is not None) \
-        else 0.0
+    # (d) Container facts and filename metadata.  A recorder writes one
+    # format for a whole session, and DR-40 take numbers increment through it.
+    if seed.take is not None and other.take is not None:
+        take_score = (1.0 if seed.take == other.take else
+                      math.exp(-abs(seed.take - other.take)
+                               / config.TAKE_PROXIMITY_DECAY))
+    else:
+        take_score = config.TAKE_PROXIMITY_NEUTRAL
+    if ignore_filenames:
+        take_score = config.TAKE_PROXIMITY_NEUTRAL
+    container = (0.30 * (seed.sample_rate == other.sample_rate)
+                 + 0.10 * (seed.channels == other.channels)
+                 + 0.10 * (seed.bits == other.bits)
+                 + 0.50 * take_score)
 
     notes: list[str] = []
-    if seed.take is not None and other.take is not None:
+    if abs(d_dc) <= config.DC_TOLERANCE_PPM:
+        notes.append(f"same converter DC bias ({other.chan[4]:+.0f} ppm)")
+    if not ignore_filenames and seed.take is not None \
+            and other.take is not None:
         if seed.take == other.take and seed.role and other.role \
                 and seed.role != other.role:
             notes.append(
                 f"dual-record pair-mate of the seed ({seed.role}<->"
                 f"{other.role}, take {seed.take:04d})")
+        elif seed.take == other.take:
+            notes.append(f"same take number ({seed.take:04d})")
         elif abs(seed.take - other.take) <= 8:
             notes.append(
                 f"adjacent take number ({other.take:04d} vs seed "

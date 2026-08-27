@@ -97,11 +97,13 @@ MAX_POSTINGS_PER_HASH = 400
 OFFSET_SMOOTH = 1
 
 #: A hit is called "confident" when the aligned vote count clears BOTH an
-#: absolute floor and a duration-proportional floor, and the votes are
-#: concentrated (rather than smeared across the file).
+#: absolute floor and a duration-proportional floor, AND the winning offset
+#: bin towers over the same file's next-tallest bin by this factor.  The
+#: sharpness test is what separates a real alignment (a spike) from a file
+#: that merely shares a lot of common hashes (a flat histogram).
 CONFIDENT_MIN_VOTES = 25
 CONFIDENT_VOTES_PER_SEED_SECOND = 0.5
-CONFIDENT_MIN_CONCENTRATION = 0.12
+CONFIDENT_MIN_SHARPNESS = 4.0
 
 #: Below this, results are not printed at all.
 REPORT_MIN_VOTES = 6
@@ -128,30 +130,64 @@ SESSION_N_REGIONS = 3  # first / middle / last
 #: Noise-floor spectrum.
 SESSION_NFFT = 2048
 SESSION_HOP = 1024
-#: Fraction of frames (quietest) used as the "noise floor".
+#: Per-bin percentile used as the noise-floor estimate (minimum statistics).
+SESSION_FLOOR_PERCENTILE = 5.0
+#: Fraction of frames (quietest) used for the per-channel noise comparison.
 SESSION_QUIET_FRACTION = 0.05
-#: Number of log-spaced bands in the stored noise-floor vector.
-NOISE_BANDS = 64
-NOISE_LO_HZ = 30.0
-NOISE_HI_HZ = 5200.0
+#: Number of log-spaced bands in the stored noise-floor vector, and the range
+#: they span.  Deliberately restricted to 40-900 Hz: below ~1 kHz the noise
+#: floor is room modes, HVAC, traffic rumble, stand coupling and preamp 1/f
+#: noise -- all specific to one rig in one room.  Above ~1 kHz it is mostly
+#: converter and preamp hiss, which looks near-identical on every recording
+#: from the same model of device and so dilutes the signal.  Measured on the
+#: DR-40 corpus: restricting to this band raised same-session/other-session
+#: separation from +0.41 to +0.65 cosine.
+NOISE_BANDS = 48
+NOISE_LO_HZ = 40.0
+NOISE_HI_HZ = 900.0
 
 #: Hum profile: high-resolution FFT over the quietest contiguous chunk.
 HUM_NFFT = 32768  # 0.336 Hz per bin at 11025 Hz
+#: Per-bin percentile across chunks.  Hum is stationary and survives it;
+#: music is transient and does not.
+HUM_PERCENTILE = 20.0
 HUM_50_HARMONICS = tuple(50.0 * k for k in range(1, 13))   # 50 .. 600
 HUM_60_HARMONICS = tuple(60.0 * k for k in range(1, 11))   # 60 .. 600
 HUM_DIM = len(HUM_50_HARMONICS) + len(HUM_60_HARMONICS)
 #: Half-width, in Hz, of the local background used as the hum reference.
 HUM_BACKGROUND_HZ = 6.0
+#: Total harmonic prominence (dB, summed over the harmonic series) below which
+#: a file is treated as having no mains hum at all.  Calibrated on the DR-40
+#: corpus, which is battery powered: its "hum" readings sum to 23-46 dB of
+#: pure measurement noise, so the gate has to sit above that.
+HUM_PRESENCE_DB = 45.0
 
-#: Channel statistics vector: [balance_dB, correlation, noisefloor_diff_dB,
-#: is_effectively_mono].
-CHAN_DIM = 4
+#: Channel statistics vector:
+#: [balance_dB, correlation, noisefloor_diff_dB, is_effectively_mono,
+#:  dc_offset_left_ppm, dc_offset_right_ppm].
+#:
+#: The DC offset is the surprise star of this feature set.  A converter's DC
+#: bias is a property of the specific input path and gain setting, it is
+#: rock-steady for a whole session, and it is unrelated to the performance.
+#: On the DR-40 corpus it separates the two rig configurations cleanly
+#: (-174 ppm / +30 ppm / -53 ppm clusters).  Caveat: any high-pass filter,
+#: normalisation or lossy encode destroys it, so it only helps when comparing
+#: original recorder output -- which is exactly the intended use.
+CHAN_DIM = 6
+#: Tolerance (ppm) for calling two DC offsets "the same".
+DC_TOLERANCE_PPM = 15.0
+
+#: Take-number proximity decay: DR-40 take numbers increment through a
+#: session, so nearby numbers are weak positive evidence.  e-folding distance.
+TAKE_PROXIMITY_DECAY = 6.0
+#: Score used when either file has no parseable take number.
+TAKE_PROXIMITY_NEUTRAL = 0.40
 
 #: Session-similarity component weights (must sum to 1.0).
-W_NOISE = 0.40
-W_HUM = 0.25
-W_CHAN = 0.20
-W_CONTAINER = 0.15
+W_NOISE = 0.35
+W_HUM = 0.10
+W_CHAN = 0.30
+W_CONTAINER = 0.25
 
 
 # --------------------------------------------------------------------------
