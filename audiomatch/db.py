@@ -264,13 +264,61 @@ class Database:
 
     def lookup(self, hash_values: Sequence[int],
                chunk: int = 900) -> Iterator[tuple[int, int, int]]:
-        """Yield ``(hash, file_id, t)`` for every posting of the given hashes."""
+        """Yield ``(hash, file_id, t)`` for every posting of the given hashes.
+
+        Row-at-a-time; :meth:`iter_postings` is what queries actually use.
+        """
         values = list(hash_values)
         for i in range(0, len(values), chunk):
             part = values[i:i + chunk]
             q = ("SELECT hash, file_id, t FROM hashes WHERE hash IN ("
                  + ",".join("?" * len(part)) + ")")
             yield from self.conn.execute(q, part)
+
+    #: Rows pulled out of sqlite per fetch before conversion to numpy.  Bounds
+    #: the number of Python integers alive at any one moment.
+    POSTING_BLOCK = 32768
+
+    def iter_postings(self, hash_values: Sequence[int], *,
+                      max_postings: Optional[int] = None,
+                      chunk: int = 900
+                      ) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """Yield ``(hash, file_id, t)`` numpy blocks for the given hashes.
+
+        ``max_postings`` skips *entirely* any hash with more postings than
+        that -- hum, hiss and room tone, which carry almost no information but
+        dominate both the cost and the noise floor.  The cap is applied by a
+        ``GROUP BY ... HAVING COUNT(*) >`` pre-filter **inside sqlite**, so an
+        overfull posting list is never materialised in Python; the previous
+        code read every posting into a list and only then discarded it, which
+        on a hum-heavy seed meant hundreds of MB of transient Python ints.
+        """
+        values = sorted({int(h) for h in hash_values})
+        for i in range(0, len(values), chunk):
+            part = values[i:i + chunk]
+            if max_postings is not None:
+                marks = ",".join("?" * len(part))
+                over = {int(r[0]) for r in self.conn.execute(
+                    f"SELECT hash FROM hashes WHERE hash IN ({marks}) "
+                    f"GROUP BY hash HAVING COUNT(*) > ?",
+                    (*part, int(max_postings)))}
+                if over:
+                    part = [h for h in part if h not in over]
+            if not part:
+                continue
+            marks = ",".join("?" * len(part))
+            cur = self.conn.execute(
+                f"SELECT hash, file_id, t FROM hashes WHERE hash IN ({marks})",
+                part)
+            while True:
+                rows = cur.fetchmany(self.POSTING_BLOCK)
+                if not rows:
+                    break
+                block = np.fromiter(
+                    (v for row in rows for v in row), dtype=np.int64,
+                    count=3 * len(rows)).reshape(len(rows), 3)
+                del rows
+                yield block[:, 0], block[:, 1], block[:, 2]
 
     def db_bytes(self) -> int:
         """On-disk size, WAL included (and checkpointed first so it is real)."""

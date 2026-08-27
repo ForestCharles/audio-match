@@ -105,10 +105,19 @@ CONFIDENT_MIN_VOTES = 25
 CONFIDENT_VOTES_PER_SEED_SECOND = 0.5
 CONFIDENT_MIN_SHARPNESS = 4.0
 
+#: Floor applied to the sharpness denominator.  When a file shares exactly one
+#: offset bin with the seed there is no second bin to measure, and dividing by
+#: 1 reported an unfalsifiable "25x" for a single lonely bin with no evidence
+#: behind it.  Treating the background as at least this many votes keeps the
+#: ratio meaningful: a file must show >= 4 x 3 = 12 aligned votes before it can
+#: clear CONFIDENT_MIN_SHARPNESS on no measured background at all.
+SHARPNESS_MIN_BACKGROUND = 3
+
 #: Below this, results are not printed at all.
 REPORT_MIN_VOTES = 6
 
-#: Sample-rate mislabel probes: (label, decode_rate).  Decoding at
+#: Sample-rate mislabel probes: (label, decode_rate).  Only the first entry
+#: (the native decode) runs unless ``query --try-rates`` is given.  Decoding at
 #: ANALYSIS_SR * r and then *interpreting* the samples as ANALYSIS_SR speeds
 #: the seed up by 1/r, which is exactly what happens when a 48 kHz file is
 #: played back as if it were 44.1 kHz (and vice versa).

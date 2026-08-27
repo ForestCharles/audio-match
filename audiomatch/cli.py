@@ -60,7 +60,10 @@ def print_match_results(res: QueryResult, out=None) -> None:
         w(f"{i:2d}. [{mark}] score {m.votes:6,}   "
           f"sharpness {m.sharpness:6.1f}x   "
           f"concentration {m.concentration * 100:5.1f}%\n")
-        w(f"      {_short(m.path)}\n")
+        w(f"      {_short(m.path)}{' [missing]' if m.missing else ''}\n")
+        if m.missing:
+            w("      this path no longer exists; re-run 'audio-match index' "
+              "on its library root to prune it\n")
         w(f"      seed 0:00 lands at {fmt_clock(m.offset_seconds)} in this "
           f"file (length {fmt_clock(m.library_duration)}); "
           f"~{m.matched_seconds:.0f}s of seed aligned\n")
@@ -124,7 +127,8 @@ def print_session_results(res: QueryResult, out=None) -> None:
     for i, h in enumerate(res.sessions, 1):
         s: SessionScore = h.score
         w(f"  {i:3d}.  {s.total:.3f}  {s.noise:.3f} {s.hum:.3f} "
-          f"{s.chan:.3f} {s.container:.3f}  {_short(h.path, 58)}\n")
+          f"{s.chan:.3f} {s.container:.3f}  {_short(h.path, 58)}"
+          f"{' [missing]' if h.missing else ''}\n")
         w(f"        {_bar(s.total)}  {h.sample_rate} Hz/{h.channels}ch/"
           f"{_bits(h.bits)}  {fmt_clock(h.duration)}\n")
         notes = list(s.notes)
@@ -196,11 +200,13 @@ def cmd_query(args: argparse.Namespace) -> int:
             return 2
         try:
             res = run_query(db, os.path.abspath(args.seed), mode=args.mode,
-                            top=args.top, sr_probes=not args.no_sr_probes,
+                            top=args.top, try_rates=args.try_rates,
                             ignore_filenames=args.ignore_filenames)
         except AudioError as exc:
             print(f"error: could not analyse seed: {exc}", file=sys.stderr)
             return 2
+    for warning in res.warnings:
+        print(f"warning: {warning}", file=sys.stderr)
     print(f"index: {args.db}  ({stats['files_ok']:,} files, "
           f"{_fmt_hms(stats['seconds'])} of audio, "
           f"{stats['hashes']:,} landmarks)")
@@ -289,8 +295,10 @@ def build_parser() -> argparse.ArgumentParser:
                     default="both")
     pq.add_argument("--top", type=int, default=10,
                     help="results per mode (default: 10)")
-    pq.add_argument("--no-sr-probes", action="store_true",
-                    help="skip the 44.1/48 kHz mislabel probes (faster)")
+    pq.add_argument("--try-rates", action="store_true",
+                    help="also re-decode the seed at the 44.1/48 kHz ratios "
+                         "to catch a seed whose header lies about its sample "
+                         "rate (3x slower; off by default)")
     pq.add_argument("--ignore-filenames", action="store_true",
                     help="score mode 2 on audio evidence only, ignoring "
                          "Tascam take numbers parsed from filenames")

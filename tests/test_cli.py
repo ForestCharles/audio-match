@@ -81,7 +81,7 @@ def test_query_modes_are_independent(corpus: Corpus, tmp_path, capsys):
     capsys.readouterr()
     seed = corpus.lib_file("0072", "S12")
 
-    main(["--db", db, "query", seed, "--mode", "match", "--no-sr-probes"])
+    main(["--db", db, "query", seed, "--mode", "match"])
     out = capsys.readouterr().out
     assert "MODE 1" in out and "MODE 2" not in out
 
