@@ -5,20 +5,33 @@ Design
 * One *writer* (the main process) owns the sqlite connection; N *workers*
   decode and fingerprint.  sqlite does not like concurrent writers, and the
   work is overwhelmingly CPU+IO in the workers anyway.
-* Work is handed out with ``imap_unordered`` so a single 1 GB file cannot stall
-  the pool.
+* Work is handed out as individual futures with a bounded in-flight window, so
+  a single 1 GB file cannot stall the pool and the queue cannot grow to the
+  size of the library.
+* ``concurrent.futures.ProcessPoolExecutor`` is used rather than
+  ``multiprocessing.Pool`` **deliberately**: if a worker is SIGKILLed (the OOM
+  killer, a segfaulting ffmpeg) ``Pool.imap_unordered`` simply blocks forever,
+  which turns an unattended multi-terabyte index run into a silent hang.  The
+  executor raises ``BrokenProcessPool`` instead, which we turn into a clear
+  message and a nonzero exit.
 * Results are committed in batches of ``COMMIT_EVERY``; a crash therefore loses
   at most that batch plus whatever the workers had in flight.
 * Resumability is keyed on ``(path, size, mtime)``.  A rerun re-stats every
   candidate file (cheap) and skips anything whose stamp is unchanged.
+* After the scan, alive rows *under the indexed root* whose file has vanished
+  are tombstoned so that queries stop ranking paths that no longer exist.
 """
 
 from __future__ import annotations
 
+import itertools
 import multiprocessing as mp
 import os
+import signal
 import sys
 import time
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from typing import Callable, Iterator, Optional
 
@@ -155,7 +168,23 @@ class Progress:
         self.stream.flush()
 
 
+#: Message shown when a worker process dies outright.
+WORKER_DIED_MESSAGE = (
+    "\nERROR: a worker died (likely OOM or a crashing decode); progress is "
+    "saved -- re-run `audio-match index` to resume")
+
+#: Test-only hook.  When this environment variable is set to a file's
+#: *basename*, the worker that picks that file up SIGKILLs itself, which is the
+#: only portable way to reproduce an OOM-killed worker.  Workers are spawned,
+#: so a monkeypatch in the parent process would not reach them; an environment
+#: variable is inherited.  Never set in normal operation.
+KILL_ENV = "AUDIOMATCH_TEST_KILL_WORKER_ON"
+
+
 def _worker(path: str) -> Analysis:
+    victim = os.environ.get(KILL_ENV)
+    if victim and os.path.basename(path) == victim:
+        os.kill(os.getpid(), signal.SIGKILL)      # pragma: no cover
     try:
         return analyze_file(path)
     except BaseException as exc:                  # pragma: no cover
@@ -163,9 +192,31 @@ def _worker(path: str) -> Analysis:
                         error=f"worker crashed: {exc!r}")
 
 
+class WorkerDied(RuntimeError):
+    """Raised internally when the process pool breaks."""
+
+
+def prune_vanished(db: Database, root: str,
+                   log: Optional[Callable[[str], None]] = None) -> int:
+    """Tombstone alive rows under ``root`` whose file no longer exists.
+
+    Only rows *under the indexed root* are considered: one database may hold
+    several roots (removable media, a second library), and a root that is not
+    currently mounted must not have its records deleted.
+    """
+    log = log or (lambda msg: None)
+    gone = [p for p in db.alive_paths_under(root) if not os.path.exists(p)]
+    for path in gone:
+        db.retire(path)
+        log(f"  PRUNE {path}")
+    if gone:
+        db.commit()
+    return len(gone)
+
+
 def run_index(db: Database, root: str, *, workers: int = 0,
               all_files: bool = False, force: bool = False,
-              retry_errors: bool = False,
+              retry_errors: bool = False, prune: bool = True,
               progress_stream=sys.stderr,
               log: Optional[Callable[[str], None]] = None) -> dict:
     """Index ``root`` into ``db``.  Returns a summary dict."""
@@ -176,7 +227,14 @@ def run_index(db: Database, root: str, *, workers: int = 0,
         f"{plan.skipped:,} unchanged and skipped, "
         f"{_fmt_bytes(plan.todo_bytes)} to read")
     summary = {"indexed": 0, "errors": 0, "skipped": plan.skipped,
-               "bytes": plan.todo_bytes, "seconds": 0.0, "hashes": 0}
+               "bytes": plan.todo_bytes, "seconds": 0.0, "hashes": 0,
+               "pruned": 0, "aborted": False}
+
+    if prune:
+        summary["pruned"] = prune_vanished(db, os.path.abspath(root), log)
+        if summary["pruned"]:
+            log(f"prune: {summary['pruned']:,} vanished file(s) pruned")
+
     if not plan.todo:
         return summary
 
@@ -207,24 +265,69 @@ def run_index(db: Database, root: str, *, workers: int = 0,
             db.commit()
             pending = 0
 
+    def consume(an: Analysis) -> None:
+        store(an)
+        progress.update(an)
+
     try:
         if n_workers == 1:
             for path in plan.todo:
-                an = _worker(path)
-                store(an)
-                progress.update(an)
+                consume(_worker(path))
         else:
-            ctx = mp.get_context("spawn")
-            with ctx.Pool(processes=n_workers) as pool:
-                for an in pool.imap_unordered(_worker, plan.todo,
-                                              chunksize=1):
-                    store(an)
-                    progress.update(an)
+            _run_pool(plan.todo, n_workers, consume)
     except KeyboardInterrupt:
         log("\ninterrupted -- committing what is done; rerun to resume")
+    except WorkerDied:
+        summary["aborted"] = True
     finally:
         db.commit()
         progress.finish()
 
+    if summary["aborted"]:
+        log(WORKER_DIED_MESSAGE)
+
     summary["seconds"] = time.time() - t0
     return summary
+
+
+#: In-flight futures per worker.  Enough to keep every worker fed across a
+#: burst of tiny files, small enough that a library of millions of paths does
+#: not become millions of live future objects.
+INFLIGHT_PER_WORKER = 4
+
+
+def _run_pool(todo: list[str], n_workers: int,
+              consume: Callable[[Analysis], None]) -> None:
+    """Fan ``todo`` out over a process pool, feeding results to ``consume``.
+
+    Raises :class:`WorkerDied` if a worker process disappears (SIGKILL, OOM
+    killer, segfault) instead of hanging forever, which is what
+    ``multiprocessing.Pool`` would do.
+    """
+    ctx = mp.get_context("spawn")
+    pending = iter(todo)
+    try:
+        with ProcessPoolExecutor(max_workers=n_workers,
+                                 mp_context=ctx) as pool:
+            window = n_workers * INFLIGHT_PER_WORKER
+            futures = {pool.submit(_worker, p)
+                       for p in itertools.islice(pending, window)}
+            while futures:
+                done, futures = wait(futures, return_when=FIRST_COMPLETED)
+                broken = None
+                for fut in done:
+                    try:
+                        consume(fut.result())
+                    except BrokenProcessPool as exc:
+                        # Keep draining: futures that *did* finish still hold
+                        # real results, and committing them is free progress.
+                        broken = exc
+                if broken is not None:
+                    for fut in futures:
+                        fut.cancel()
+                    raise WorkerDied(str(broken)) from broken
+                futures |= {pool.submit(_worker, p)
+                            for p in itertools.islice(pending, len(done))}
+    except BrokenProcessPool as exc:
+        # The executor's own shutdown can surface the breakage too.
+        raise WorkerDied(str(exc)) from exc

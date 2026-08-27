@@ -268,3 +268,205 @@ def test_analyze_file_survives_a_stderr_flood(tmp_path):
     an = analyze_file(_corrupt_mp3(tmp_path))
     assert an.status == "ok"
     assert an.n_hashes > 0
+
+
+# --------------------------------------------------------------------------
+# Worker death (FIX 1)
+# --------------------------------------------------------------------------
+
+
+def synthetic_library(root, n: int = 6, seconds: float = 4.0) -> str:
+    """``n`` short, distinct, genuinely decodable WAVs.  No corpus needed."""
+    os.makedirs(root, exist_ok=True)
+    for i in range(n):
+        dst = os.path.join(root, f"tone{i:02d}.wav")
+        if os.path.exists(dst):
+            continue
+        freq = 300 + 137 * i
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-y",
+             "-f", "lavfi", "-i",
+             f"anoisesrc=d={seconds}:c=pink:r=48000:a=0.5:seed={i}",
+             "-f", "lavfi", "-i",
+             f"sine=frequency={freq}:duration={seconds}:sample_rate=48000",
+             "-filter_complex",
+             "[0:a][1:a]amix=inputs=2:weights=1 1,"
+             "aformat=sample_fmts=s16:channel_layouts=stereo",
+             "-ar", "48000", "-c:a", "pcm_s16le", dst],
+            check=True, capture_output=True)
+    return str(root)
+
+
+def _index_stats(db_path: str) -> dict:
+    with open_db(db_path, create=False) as db:
+        s = db.stats()
+    return {k: s[k] for k in ("files_ok", "files_live", "hashes")}
+
+
+def test_a_sigkilled_worker_aborts_cleanly_and_the_rerun_resumes(
+        tmp_path, monkeypatch):
+    """A worker that dies must abort the run, not hang it.
+
+    ``multiprocessing.Pool.imap_unordered`` blocks forever when a worker is
+    SIGKILLed (OOM killer, segfaulting ffmpeg), which silently stalls an
+    unattended multi-terabyte index run.  The executor must raise instead.
+    """
+    from audiomatch.indexer import KILL_ENV
+
+    lib = synthetic_library(tmp_path / "lib")
+
+    clean_db = str(tmp_path / "clean.db")
+    with open_db(clean_db) as db:
+        clean = run_index(db, lib, workers=2, progress_stream=None)
+    assert clean["indexed"] == 6 and clean["aborted"] is False
+
+    victim_db = str(tmp_path / "victim.db")
+    monkeypatch.setenv(KILL_ENV, "tone03.wav")
+    logged: list[str] = []
+    with open_db(victim_db) as db:
+        first = run_index(db, lib, workers=2, progress_stream=None,
+                          log=logged.append)
+    assert first["aborted"] is True
+    assert first["indexed"] < 6
+    assert any("a worker died" in line for line in logged), logged
+    assert any("re-run `audio-match index` to resume" in line
+               for line in logged)
+
+    # The database survived the abort and is readable.
+    with open_db(victim_db, create=False) as db:
+        assert db.stats()["files_live"] == first["indexed"] + first["errors"]
+
+    # And the rerun, without the hostile worker, reproduces a clean index.
+    monkeypatch.delenv(KILL_ENV)
+    with open_db(victim_db) as db:
+        second = run_index(db, lib, workers=2, progress_stream=None)
+    assert second["aborted"] is False
+    assert second["indexed"] + second["skipped"] == 6
+    assert _index_stats(victim_db) == _index_stats(clean_db)
+
+
+def test_worker_death_makes_the_index_command_exit_nonzero(tmp_path,
+                                                           monkeypatch):
+    from audiomatch.cli import main
+    from audiomatch.indexer import KILL_ENV
+
+    lib = synthetic_library(tmp_path / "lib")
+    monkeypatch.setenv(KILL_ENV, "tone03.wav")
+    rc = main(["--db", str(tmp_path / "x.db"), "index", lib,
+               "--workers", "2"])
+    assert rc == 1
+
+
+# --------------------------------------------------------------------------
+# Pruning vanished files (FIX 2)
+# --------------------------------------------------------------------------
+
+
+def test_renamed_file_is_pruned_and_the_new_path_goes_live(tmp_path):
+    lib = synthetic_library(tmp_path / "lib", n=3)
+    db_path = str(tmp_path / "prune.db")
+    with open_db(db_path) as db:
+        run_index(db, lib, workers=1, progress_stream=None)
+
+    old = os.path.join(lib, "tone01.wav")
+    new = os.path.join(lib, "renamed.wav")
+    os.rename(old, new)
+
+    logged: list[str] = []
+    with open_db(db_path) as db:
+        summary = run_index(db, lib, workers=1, progress_stream=None,
+                            log=logged.append)
+    assert summary["pruned"] == 1
+    assert summary["indexed"] == 1          # the new name
+    assert summary["skipped"] == 2
+    assert any("vanished file(s) pruned" in line for line in logged)
+
+    with open_db(db_path, create=False) as db:
+        alive = {r[0] for r in db.conn.execute(
+            "SELECT path FROM files WHERE alive = 1")}
+        assert new in alive and old not in alive
+        # The pruned row's landmarks are still there, unreachable, until purge.
+        live = db.live_ids()
+        reachable = {r[0] for r in db.conn.execute(
+            "SELECT DISTINCT file_id FROM hashes")}
+        assert reachable - live, "expected orphaned landmarks before purge"
+        removed, files = db.purge()
+        assert files == 1 and removed > 0
+        reachable = {r[0] for r in db.conn.execute(
+            "SELECT DISTINCT file_id FROM hashes")}
+        assert reachable <= db.live_ids()
+        assert db.stats()["files_ok"] == 3
+
+
+def test_prune_leaves_rows_outside_the_indexed_root_alone(tmp_path):
+    """One database may hold several roots; an unrelated root is untouched."""
+    lib = synthetic_library(tmp_path / "lib", n=2)
+    other = str(tmp_path / "elsewhere" / "somewhere-else.wav")
+
+    db_path = str(tmp_path / "roots.db")
+    with open_db(db_path) as db:
+        run_index(db, lib, workers=1, progress_stream=None)
+        db.add_file(path=other, size=1, mtime=1.0, status="ok", error=None,
+                    probe_duration=1.0, sample_rate=48000, channels=2,
+                    bits=16, codec="pcm", sig=None)
+        db.commit()
+
+    os.remove(os.path.join(lib, "tone00.wav"))
+    with open_db(db_path) as db:
+        summary = run_index(db, lib, workers=1, progress_stream=None)
+        alive = {r[0] for r in db.conn.execute(
+            "SELECT path FROM files WHERE alive = 1")}
+    assert summary["pruned"] == 1
+    assert other in alive, "a row under a different root must not be pruned"
+
+
+def test_prune_can_be_disabled(tmp_path):
+    lib = synthetic_library(tmp_path / "lib", n=2)
+    db_path = str(tmp_path / "noprune.db")
+    with open_db(db_path) as db:
+        run_index(db, lib, workers=1, progress_stream=None)
+    os.remove(os.path.join(lib, "tone00.wav"))
+    with open_db(db_path) as db:
+        summary = run_index(db, lib, workers=1, prune=False,
+                            progress_stream=None)
+        assert db.stats()["files_live"] == 2
+    assert summary["pruned"] == 0
+
+
+# --------------------------------------------------------------------------
+# purge parameter limits (FIX 5)
+# --------------------------------------------------------------------------
+
+
+def test_purge_handles_more_live_files_than_the_sqlite_parameter_cap(
+        tmp_path):
+    """>999 live files used to overflow SQLITE_MAX_VARIABLE_NUMBER."""
+    db_path = str(tmp_path / "many.db")
+    with open_db(db_path) as db:
+        n_live = 1500
+        for i in range(n_live):
+            fid = db.add_file(
+                path=f"/lib/live{i:05d}.wav", size=1, mtime=1.0, status="ok",
+                error=None, probe_duration=1.0, sample_rate=48000,
+                channels=2, bits=16, codec="pcm", sig=None,
+                hashes=np.array([i, i + 1], dtype=np.int64),
+                times=np.array([0, 1], dtype=np.int64))
+            assert fid > 0
+        # A handful of superseded rows whose landmarks must be reclaimed.
+        for i in range(5):
+            db.add_file(path=f"/lib/dead{i}.wav", size=1, mtime=1.0,
+                        status="ok", error=None, probe_duration=1.0,
+                        sample_rate=48000, channels=2, bits=16, codec="pcm",
+                        sig=None,
+                        hashes=np.array([900000 + i], dtype=np.int64),
+                        times=np.array([0], dtype=np.int64))
+            db.retire(f"/lib/dead{i}.wav")
+        db.commit()
+
+        removed, files = db.purge()
+        assert files == 5
+        assert removed == 5
+        assert db.stats()["files_ok"] == n_live
+        reachable = {r[0] for r in db.conn.execute(
+            "SELECT DISTINCT file_id FROM hashes")}
+        assert reachable <= db.live_ids()

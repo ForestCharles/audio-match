@@ -155,6 +155,7 @@ def cmd_index(args: argparse.Namespace) -> int:
         summary = run_index(
             db, root, workers=args.workers, all_files=args.all_files,
             force=args.force, retry_errors=args.retry_errors,
+            prune=not args.no_prune,
             progress_stream=None if args.quiet else sys.stderr,
             log=(lambda m: None) if args.quiet
             else (lambda m: print(m, file=sys.stderr)))
@@ -162,7 +163,8 @@ def cmd_index(args: argparse.Namespace) -> int:
     secs = summary["seconds"]
     print(f"\nindexed {summary['indexed']:,} file(s), "
           f"{summary['errors']:,} error(s), "
-          f"{summary['skipped']:,} unchanged", file=sys.stderr)
+          f"{summary['skipped']:,} unchanged, "
+          f"{summary['pruned']:,} vanished files pruned", file=sys.stderr)
     print(f"read {_fmt_bytes(summary['bytes'])} in {_fmt_hms(secs)}"
           f" ({_fmt_bytes(summary['bytes'] / secs) if secs else '0 B'}/s)",
           file=sys.stderr)
@@ -178,7 +180,7 @@ def cmd_index(args: argparse.Namespace) -> int:
         print(f"note: {stats['files_dead']:,} superseded file record(s) still "
               "hold landmarks; run 'audio-match purge' to reclaim the space",
               file=sys.stderr)
-    return 0
+    return 1 if summary["aborted"] else 0
 
 
 def cmd_query(args: argparse.Namespace) -> int:
@@ -273,6 +275,10 @@ def build_parser() -> argparse.ArgumentParser:
                          "unchanged")
     pi.add_argument("--retry-errors", action="store_true",
                     help="retry files that previously failed to decode")
+    pi.add_argument("--no-prune", action="store_true",
+                    help="keep records for files that have vanished from the "
+                         "indexed root (use when the root is a mount point "
+                         "that may not be mounted)")
     pi.add_argument("--quiet", action="store_true",
                     help="suppress progress output")
     pi.set_defaults(func=cmd_index)

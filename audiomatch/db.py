@@ -181,6 +181,19 @@ class Database:
         return {r[0]: (int(r[1] or 0), float(r[2] or 0.0), str(r[3] or ""))
                 for r in cur}
 
+    def alive_paths_under(self, root: str) -> list[str]:
+        """Every live file path at or below ``root``.
+
+        Matching is done in Python on an absolute, normalised prefix rather
+        than with SQL ``LIKE``, which has no usable escaping for the ``%`` and
+        ``_`` that occur constantly in real filenames.
+        """
+        root = os.path.abspath(root)
+        prefix = root.rstrip(os.sep) + os.sep
+        cur = self.conn.execute("SELECT path FROM files WHERE alive = 1")
+        return [r[0] for r in cur
+                if r[0] == root or r[0].startswith(prefix)]
+
     def retire(self, path: str) -> None:
         """Mark any live row for ``path`` dead (its landmarks become garbage)."""
         self.conn.execute(
@@ -299,10 +312,19 @@ class Database:
         live = self.live_ids()
         before = self.conn.execute("SELECT COUNT(*) FROM hashes").fetchone()[0]
         if live:
-            placeholders = ",".join("?" * len(live))
+            # A parameter per live file overflows SQLITE_MAX_VARIABLE_NUMBER
+            # (999 before sqlite 3.32, i.e. Ubuntu 20.04) on any real library,
+            # so the id set goes through a temp table instead.
+            self.conn.execute("DROP TABLE IF EXISTS temp._live_ids")
             self.conn.execute(
-                f"DELETE FROM hashes WHERE file_id NOT IN ({placeholders})",
-                list(live))
+                "CREATE TEMP TABLE _live_ids (id INTEGER PRIMARY KEY)")
+            self.conn.executemany(
+                "INSERT INTO temp._live_ids(id) VALUES(?)",
+                ((int(i),) for i in live))
+            self.conn.execute(
+                "DELETE FROM hashes WHERE file_id NOT IN "
+                "(SELECT id FROM temp._live_ids)")
+            self.conn.execute("DROP TABLE temp._live_ids")
         else:
             self.conn.execute("DELETE FROM hashes")
         n_dead = self.conn.execute(
