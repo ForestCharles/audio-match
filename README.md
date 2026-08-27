@@ -398,7 +398,7 @@ CREATE TABLE hashes (
 
 ```bash
 pip install pytest
-python3 -m pytest tests/          # ~90 seconds
+python3 -m pytest tests/          # ~2 minutes
 ```
 
 The suite runs against the **real** recovered DR-40 corpus in

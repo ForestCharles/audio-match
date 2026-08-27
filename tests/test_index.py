@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 import time
 
 import numpy as np
@@ -209,3 +210,61 @@ def test_stale_schema_is_rejected(tmp_path, small_library):
         db.conn.commit()
     with pytest.raises(RuntimeError, match="re-index"):
         open_db(db_path)
+
+
+def _corrupt_mp3(tmp_path) -> str:
+    """An MP3 whose every frame is damaged: ffmpeg emits >64 KB of stderr."""
+    import subprocess
+    clean = tmp_path / "clean.mp3"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+         "sine=frequency=440:duration=240", "-c:a", "libmp3lame",
+         "-b:a", "320k", str(clean)], check=True, capture_output=True)
+    data = bytearray(clean.read_bytes())
+    for i in range(2000, len(data), 120):
+        data[i] ^= 0xFF
+    bad = tmp_path / "corrupt.mp3"
+    bad.write_bytes(bytes(data))
+    return str(bad)
+
+
+def test_decode_stream_does_not_deadlock_on_a_stderr_flood(tmp_path):
+    """Regression: a file that floods ffmpeg's stderr must still decode.
+
+    ffmpeg's stderr is a pipe with a ~64 KB buffer.  If it is not drained
+    while stdout is being read, ffmpeg blocks writing errors, stops producing
+    audio, and the decode hangs forever -- unrecoverably, in a worker, in the
+    middle of an unattended 1.45 TB index.
+    """
+    import threading
+
+    from audiomatch import audio
+
+    bad = _corrupt_mp3(tmp_path)
+    proc = subprocess.run(
+        ["ffmpeg", "-v", "error", "-nostdin", "-i", bad, "-map", "0:a:0",
+         "-ac", "2", "-ar", str(config.ANALYSIS_SR), "-f", "f32le", "-"],
+        capture_output=True)
+    assert len(proc.stderr) > 65536, (
+        f"fixture is not hostile enough: only {len(proc.stderr)} B of stderr")
+
+    result: dict = {}
+
+    def decode():
+        try:
+            result["frames"] = sum(
+                b.shape[0] for b in audio.decode_stream(bad))
+        except Exception as exc:                        # noqa: BLE001
+            result["exc"] = repr(exc)
+
+    th = threading.Thread(target=decode, daemon=True)
+    th.start()
+    th.join(120)
+    assert not th.is_alive(), "decode_stream deadlocked on ffmpeg's stderr"
+    assert result.get("frames", 0) > config.ANALYSIS_SR, result
+
+
+def test_analyze_file_survives_a_stderr_flood(tmp_path):
+    an = analyze_file(_corrupt_mp3(tmp_path))
+    assert an.status == "ok"
+    assert an.n_hashes > 0

@@ -312,6 +312,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except AudioError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    except RuntimeError as exc:
+        # e.g. a database written by an incompatible fingerprint schema.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
         return 130

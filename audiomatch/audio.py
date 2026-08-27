@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass
 from typing import Iterator, Optional
 
@@ -167,6 +168,15 @@ def decode_stream(path: str, *, rate: int = config.ANALYSIS_SR,
     cmd = _decode_cmd(path, rate, channels, None, None)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
+    # Drain stderr concurrently.  A corrupt file can make ffmpeg emit far more
+    # than a pipe buffer's worth of error lines; if nobody reads them ffmpeg
+    # blocks on write(2), stops producing stdout, and the decode deadlocks
+    # forever.  Recovered/carved files do exactly this.
+    err_chunks: list[bytes] = []
+    err_thread = threading.Thread(
+        target=lambda p, out: out.append(p.read()),
+        args=(proc.stderr, err_chunks), daemon=True)
+    err_thread.start()
     nbytes = block_frames * channels * 4
     stderr_tail = b""
     try:
@@ -190,8 +200,9 @@ def decode_stream(path: str, *, rate: int = config.ANALYSIS_SR,
     finally:
         if proc.stdout is not None:
             proc.stdout.close()
+        err_thread.join(timeout=30.0)
+        stderr_tail = b"".join(err_chunks)[-2000:]
         if proc.stderr is not None:
-            stderr_tail = proc.stderr.read()[-2000:]
             proc.stderr.close()
         proc.wait()
     if proc.returncode not in (0, None):

@@ -101,3 +101,23 @@ def test_errors_subcommand(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "broken.wav" in out
     assert "1 file(s) failed to index." in out
+
+
+def test_stale_schema_exits_cleanly_without_a_traceback(tmp_path, capsys):
+    """A DB from an older fingerprint schema must be an error, not a crash."""
+    import sqlite3
+
+    from audiomatch.db import open_db
+
+    db = str(tmp_path / "stale.db")
+    open_db(db).close()
+    con = sqlite3.connect(db)
+    con.execute("UPDATE meta SET value='999' WHERE key='schema_version'")
+    con.commit()
+    con.close()
+
+    rc = main(["--db", db, "stats"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "re-index" in err
+    assert "Traceback" not in err
