@@ -91,6 +91,11 @@ def print_match_results(res: QueryResult, out=None) -> None:
           "similarity.\n")
 
 
+def _bits(n: int) -> str:
+    """Bit depth, or '?' for codecs that do not report one (MP3, Opus, ...)."""
+    return f"{n}-bit" if n else "?-bit"
+
+
 def _bar(x: float, width: int = 10) -> str:
     n = int(round(max(0.0, min(1.0, x)) * width))
     return "#" * n + "." * (width - n)
@@ -102,7 +107,8 @@ def print_session_results(res: QueryResult, out=None) -> None:
     sig = res.seed_signature
     if sig is not None:
         mains = sig.mains_hz
-        w(f"seed: {sig.sample_rate} Hz / {sig.channels} ch / {sig.bits}-bit"
+        w(f"seed: {sig.sample_rate} Hz / {sig.channels} ch / "
+          f"{_bits(sig.bits)}"
           f"   L-R balance {sig.chan[0]:+.1f} dB"
           f"   L/R correlation {sig.chan[1]:+.2f}"
           f"   noise-floor L-R {sig.chan[2]:+.1f} dB"
@@ -120,7 +126,7 @@ def print_session_results(res: QueryResult, out=None) -> None:
         w(f"  {i:3d}.  {s.total:.3f}  {s.noise:.3f} {s.hum:.3f} "
           f"{s.chan:.3f} {s.container:.3f}  {_short(h.path, 58)}\n")
         w(f"        {_bar(s.total)}  {h.sample_rate} Hz/{h.channels}ch/"
-          f"{h.bits}-bit  {fmt_clock(h.duration)}\n")
+          f"{_bits(h.bits)}  {fmt_clock(h.duration)}\n")
         notes = list(s.notes)
         if h.is_pair_mate:
             notes.insert(0, "LIKELY DUAL-RECORD PAIR-MATE OF THE SEED")
