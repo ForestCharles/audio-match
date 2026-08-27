@@ -21,7 +21,7 @@ import numpy as np
 
 from . import config
 from .analyze import analyze_seed
-from .db import Database, FileRow
+from .db import Database
 from .session import Signature, SessionScore, compare, pair_mate_role
 
 #: Guard against pathological seeds (someone seeds with a 3-hour file).

@@ -38,8 +38,8 @@ def _short(path: str, width: int = 78) -> str:
     return "..." + path[-(width - 3):]
 
 
-def print_match_results(res: QueryResult, out=sys.stdout) -> None:
-    w = out.write
+def print_match_results(res: QueryResult, out=None) -> None:
+    w = (out or sys.stdout).write
     w("\n== MODE 1: same audio (constellation match) ==\n")
     threshold = max(config.CONFIDENT_MIN_VOTES,
                     config.CONFIDENT_VOTES_PER_SEED_SECOND * res.seed_seconds)
@@ -96,8 +96,8 @@ def _bar(x: float, width: int = 10) -> str:
     return "#" * n + "." * (width - n)
 
 
-def print_session_results(res: QueryResult, out=sys.stdout) -> None:
-    w = out.write
+def print_session_results(res: QueryResult, out=None) -> None:
+    w = (out or sys.stdout).write
     w("\n== MODE 2: same session (heuristic signature ranking) ==\n")
     sig = res.seed_signature
     if sig is not None:

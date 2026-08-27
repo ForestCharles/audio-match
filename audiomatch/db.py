@@ -20,7 +20,7 @@ import os
 import sqlite3
 import time
 from dataclasses import dataclass
-from typing import Iterable, Iterator, Optional, Sequence
+from typing import Iterator, Optional, Sequence
 
 import numpy as np
 

@@ -24,16 +24,6 @@ from .audio import to_mono
 
 _EPS = 1e-12
 
-_TASCAM_RE = re.compile(
-    r"(?:^|[^0-9A-Za-z])"
-    r"(?P<prefix>TASCAM|DR-?40|ZOOM)?[ _-]*"
-    r"(?P<take>\d{4})"
-    r"(?P<role>S12|S34|_?[12]|_?[34])?"
-    r"(?=\.|_|$)",
-    re.IGNORECASE,
-)
-
-
 @dataclass(frozen=True)
 class TascamName:
     take: Optional[int] = None

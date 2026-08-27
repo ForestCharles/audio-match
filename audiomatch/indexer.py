@@ -20,7 +20,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Callable, Iterable, Iterator, Optional
+from typing import Callable, Iterator, Optional
 
 from . import config
 from .analyze import Analysis, analyze_file
