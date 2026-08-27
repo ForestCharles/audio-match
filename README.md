@@ -56,7 +56,7 @@ audio-match --db /var/lib/audio-match.db query ~/seed.wav --mode match --top 20
 
 | Command | What it does |
 | --- | --- |
-| `index <dir>` | Scan and fingerprint a library. Resumable. |
+| `index <dir>` | Scan and fingerprint a library. Resumable; prunes files that have vanished from the root. |
 | `query <file>` | Search with a seed file. `--mode match\|session\|both` (default `both`). |
 | `stats` | Index size, hours of audio, landmark count, bytes per hour. |
 | `errors` | List every file that failed to decode, with the reason. |
@@ -68,8 +68,11 @@ Useful flags:
 * `index --all-files` — try every file, not just the audio extension allowlist.
 * `index --force` — re-index everything, ignoring the resume stamps.
 * `index --retry-errors` — retry files that previously failed to decode.
+* `index --no-prune` — keep records for files that have vanished from the
+  indexed root (see [Pruning vanished files](#pruning-vanished-files)).
 * `query --top N` — how many results per mode (default 10).
-* `query --no-sr-probes` — skip the 44.1/48 kHz mislabel probes (3x faster).
+* `query --try-rates` — also try the 44.1/48 kHz mislabel probes (3x slower,
+  **off by default**; see [Sample-rate mislabelling](#sample-rate-mislabelling)).
 * `query --ignore-filenames` — score mode 2 on audio evidence only.
 
 ---
@@ -120,6 +123,34 @@ A result is labelled `[MATCH  ]` when it clears **both**:
 Anything else prints as `[weak   ]`. If nothing clears the bar, the tool says
 so explicitly rather than handing you a best-of-the-noise answer.
 
+**The sharpness denominator has a floor.** Some files share exactly *one*
+offset bin with the seed — there is no second bin, so there is nothing to
+measure the winner against. Dividing by 1 there produced an unfalsifiable
+`25.0x` (and a `[MATCH  ]`) for a lone bin backed by no evidence at all, so the
+background is floored at **3 votes**: sharpness is `votes / max(background, 3)`.
+Consequences worth knowing:
+
+* A file with a genuinely measured background (anything ≥ 3) scores exactly as
+  it always did — this changes no real result.
+* A lone bin can never report more than `votes / 3`, and needs at least
+  `4 × 3 = 12` aligned votes before it can clear the sharpness bar at all.
+* So a lone bin still has to clear the *vote* floor on its own merits. Sharpness
+  is a ratio, not proof; a 25-vote match against a silent background is exactly
+  as trustworthy as 25 votes, no more.
+
+Results whose library file has since been deleted or moved are annotated
+`[missing]` — the index can always be older than the filesystem. Re-run
+`audio-match index` on that library root to prune them (below).
+
+**Uninformative hashes are skipped.** Mains hum, tape hiss and room tone
+produce a handful of hashes that occur in nearly every file in the library.
+They carry almost no information but would dominate both the cost and the noise
+floor, so any hash with more than `MAX_POSTINGS_PER_HASH` (400) postings is
+dropped from the query entirely. The cap is applied *inside SQLite*, by a
+`GROUP BY … HAVING COUNT(*)` pre-filter, so an overfull posting list is never
+read into memory — on a hum-heavy seed that is the difference between tens of
+megabytes of transient Python objects and effectively none.
+
 **What it survives.** Verified against the real corpus (see `tests/`):
 44.1 ↔ 48 kHz resampling, ±10 dB gain changes, 128 and 320 kbps MP3, and a 30 s
 excerpt taken from the middle of a longer file. The worst case — all of those
@@ -133,10 +164,22 @@ their true sample rate is uncertain. A 48 kHz recording carrying a 44.1 kHz
 header plays 8.8% slow, and every frequency in it shifts by a factor of 0.919 —
 which destroys a constellation match outright.
 
-So every query is run three times: once natively, once with the seed decoded at
-`11025 × 44100/48000` Hz and once at `11025 × 48000/44100` Hz, then reinterpreted
-as 11025 Hz. That is a pure ffmpeg `-ar` change, so it costs a re-decode of the
-seed and nothing else. A hit found on one of the shifted probes is reported as:
+Pass **`--try-rates`** and the query is run three times: once natively, once
+with the seed decoded at `11025 × 44100/48000` Hz and once at
+`11025 × 48000/44100` Hz, then reinterpreted as 11025 Hz. That is a pure ffmpeg
+`-ar` change, so it costs a re-decode of the seed and nothing else — but it is
+still three decodes instead of one, which is why it is **off by default**.
+
+**When to use it.** Turn it on when the *seed's own* header may be a
+reconstructed guess rather than something the recorder wrote: carved files,
+files recovered from a damaged card, anything hand-patched. In this project's
+corpus `pakDR40_earlier.wav` is exactly that case — its 44.1 kHz rate was
+assumed from provenance, not read from an intact header, so it is a seed worth
+querying with `--try-rates`. If your seed came straight off a recorder, or you
+have otherwise confirmed its rate, the extra two probes cannot tell you anything
+and you are paying 3x the seed decode for nothing.
+
+A hit found on one of the shifted probes is reported as:
 
 ```
       *** MATCH AT WRONG SAMPLE RATE *** seed-is-48k-labelled-44.1k: the seed
@@ -146,8 +189,9 @@ seed and nothing else. A hit found on one of the shifted probes is reported as:
 
 The reported time offset is always on the **library file's** timeline.
 
-Use `--no-sr-probes` if you know your seed's rate is right and want the query
-three times faster.
+Note that this probe only compensates for a wrong header on the **seed**. A
+*library* file with a mislabelled header is found by seeding with a file you
+trust and passing `--try-rates`, which shifts the seed to meet it.
 
 ### Interpreting S12 / S34 dual-record pairs
 
@@ -309,13 +353,64 @@ covering index, roughly halving bytes per landmark.
   the next run (they would fail again). `audio-match errors` lists them;
   `index --retry-errors` retries them.
 
+**If a worker dies.** A decode that gets the worker process killed outright —
+the OOM killer picking it off, a segfaulting ffmpeg — is not the same as a file
+that fails to decode, because there is no exception to catch and no error to
+record. The run prints
+
+```
+ERROR: a worker died (likely OOM or a crashing decode); progress is saved --
+re-run `audio-match index` to resume
+```
+
+and exits **nonzero**. Everything committed so far is intact, so the fix is
+simply to run the same command again: the resume stamps skip everything already
+done and the run picks up where it stopped. If it dies again in the same place,
+the culprit is one specific file — `--workers 1` will make the run stop *on*
+that file so you can identify and exclude it, and lowering `--workers` reduces
+peak memory if the OOM killer is the cause.
+
+(This is why the pool is a `ProcessPoolExecutor` rather than a
+`multiprocessing.Pool`: `Pool.imap_unordered` simply blocks forever when a
+worker disappears, which turns a nine-hour unattended run into a silent hang
+with no output and no error.)
+
+### Pruning vanished files
+
+Deleting or renaming a library file does not, on its own, remove it from the
+index — so without a prune pass, queries go on ranking paths that no longer
+exist. After each scan, `audio-match index` tombstones every live record **under
+the root it was given** whose path has vanished, and reports the count:
+
+```
+indexed 12 file(s), 0 error(s), 8,431 unchanged, 3 vanished files pruned
+```
+
+A renamed file therefore produces two changes in one run: the old path is pruned
+and the new path is indexed fresh. Pruning uses the same tombstone mechanism as
+re-indexing, so the vanished file's landmarks become unreachable immediately and
+are reclaimed by `audio-match purge` along with everything else.
+
+**Records outside the indexed root are never touched.** One database may hold
+several roots — a second library, a removable drive — and `index /mnt/library`
+must not delete the records for `/media/archive`. The prune pass is scoped
+strictly to paths at or below the root you passed on this run, so each root is
+pruned only by a run that actually scanned it.
+
+The corollary is a real hazard: if a root is a **mount point and it is not
+mounted**, the directory looks empty and every record under it is a vanished
+file. Use `--no-prune` for those roots, or make the mount a precondition of the
+indexing job.
+
 **Superseded files and `purge`.** There is deliberately no index on
 `hashes.file_id` — adding one would roughly double the database, and it would
 only ever be used for deletion. Instead, re-indexing a changed file marks the old
 record dead and writes a new one with a fresh id. Queries skip dead ids, so
 results stay correct, but the old landmarks still occupy space. `audio-match
 index` tells you when this has happened; `audio-match purge` reclaims it in a
-single sequential rewrite. You will rarely need it.
+single sequential rewrite. Pruned (vanished) files use the same mechanism, so a
+library that churns will accumulate reclaimable space the same way. You will
+rarely need it.
 
 **Progress output** goes to stderr and shows files done/total, bytes done/total,
 throughput, elapsed time, ETA and a running error count. Piped output degrades
@@ -339,9 +434,15 @@ to one line every 50 files instead of a redrawing status line.
 * **Mode 1 needs a few seconds.** Below about 10 seconds of seed the vote counts
   get thin and the `max(25, …)` floor starts rejecting real matches. 30 seconds
   is comfortable.
-* **Heavy time-stretching is not handled.** The two 44.1/48 kHz probes are the
-  only speed variations tested. A genuine tempo change, a varispeed transfer or
-  a pitch-shift will not match.
+* **Heavy time-stretching is not handled.** The two 44.1/48 kHz probes
+  (`--try-rates`) are the only speed variations tested, and they are off by
+  default. A genuine tempo change, a varispeed transfer or a pitch-shift will
+  not match.
+* **Very long seeds are subsampled.** Above 400 000 landmarks — roughly 2.5
+  hours of audio at the query peak density — the seed is uniformly subsampled
+  down to the cap and the query prints a warning. The result is still usable,
+  but its scores are lower than an uncapped query would give and so are not
+  comparable with those of a normal-length seed. Seed with an excerpt instead.
 * **Silence and near-silence produce no landmarks.** A file of room tone cannot
   be matched by mode 1 at all (mode 2 will still rank it).
 * **The peak-density budget is a real trade-off.** 16 landmarks/second is sparse
