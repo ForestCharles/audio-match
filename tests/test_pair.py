@@ -209,6 +209,9 @@ def test_drift_below_the_resolution_floor_is_reported_as_such(
 
         -232: 2715   -116: 2172   0: 3189   +116: 3322   +232: 2715
 
+    (measured over the full 600 s of library; this test indexes 300 s of it,
+    which halves every count and changes nothing else).
+
     The injected drift is +104 ppm, and compensating for it recovers 4% more
     votes.  That is not a measurement, it is a coin flip: 104 ppm over 600 s
     is 65 ms, less than one smoothed histogram bin, so there is nothing to
@@ -221,8 +224,10 @@ def test_drift_below_the_resolution_floor_is_reported_as_such(
     """
     lib = tmp_path / "clean"
     lib.mkdir()
-    import shutil
-    shutil.copy(pair_corpus.seed_file("0077"), lib / "clean_0077S34.wav")
+    # Half the seed's length is plenty of library file: the drift resolution
+    # is set by how long the *seed* is, and 300 s still overlaps in full.
+    cut(pair_corpus.seed_file("0077"), str(lib / "clean_0077S34.wav"),
+        0.0, 300.0)
     db_path = str(tmp_path / "clean.db")
     with open_db(db_path) as db:
         assert run_index(db, str(lib), workers=1,
@@ -324,10 +329,10 @@ def test_a_silent_seed_does_not_crash(tmp_path):
     """Silence has no envelope shape to align, and must say so."""
     lib = tmp_path / "lib"
     lib.mkdir()
-    run_ffmpeg(["-f", "lavfi", "-i", "anoisesrc=d=300:c=pink:r=48000:a=0.4",
+    run_ffmpeg(["-f", "lavfi", "-i", "anoisesrc=d=150:c=pink:r=16000:a=0.4",
                 "-ac", "2", "-c:a", "pcm_s16le", str(lib / "noise.wav")])
     seed = str(tmp_path / "silence.wav")
-    run_ffmpeg(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "300",
+    run_ffmpeg(["-f", "lavfi", "-i", "anullsrc=r=16000:cl=stereo", "-t", "150",
                 "-c:a", "pcm_s16le", seed])
 
     db_path = str(tmp_path / "s.db")
@@ -339,7 +344,7 @@ def test_a_silent_seed_does_not_crash(tmp_path):
 
 
 def test_a_seed_longer_than_every_candidate_still_works(tmp_path):
-    """A 15-minute seed against a 3-minute library file: the comparison is
+    """A 10-minute seed against a 3-minute library file: the comparison is
     scored on the candidate's own three minutes, not diluted by the rest.
 
     The loudness modulation is deliberately aperiodic -- two incommensurate
@@ -350,13 +355,13 @@ def test_a_seed_longer_than_every_candidate_still_works(tmp_path):
     lib.mkdir()
     long_wav = str(tmp_path / "long.wav")
     run_ffmpeg(["-f", "lavfi",
-                "-i", "anoisesrc=d=900:c=pink:r=16000:a=0.4:seed=1",
+                "-i", "anoisesrc=d=600:c=pink:r=16000:a=0.4:seed=1",
                 "-filter_complex",
                 "[0:a]volume="
                 "'0.05+0.95*gt(sin(2*PI*t/97)+sin(2*PI*t/53),0.35)'"
                 ":eval=frame,aformat=channel_layouts=stereo",
                 "-c:a", "pcm_s16le", long_wav])
-    run_ffmpeg(["-ss", "300", "-t", "180", "-i", long_wav,
+    run_ffmpeg(["-ss", "200", "-t", "180", "-i", long_wav,
                 "-c", "copy", str(lib / "excerpt.wav")])
     db_path = str(tmp_path / "l.db")
     with open_db(db_path) as db:
@@ -367,7 +372,7 @@ def test_a_seed_longer_than_every_candidate_still_works(tmp_path):
     assert len(hits) == 1
     a = hits[0].alignment
     assert a.ok
-    assert a.lag == pytest.approx(-300, abs=2)
+    assert a.lag == pytest.approx(-200, abs=2)
     assert a.overlap == pytest.approx(180, abs=2)
     assert a.raw_r > 0.9
 
@@ -376,7 +381,7 @@ def test_an_index_with_no_envelopes_at_all_says_so(tmp_path):
     import sqlite3
     from test_index import synthetic_library
 
-    lib = synthetic_library(tmp_path / "lib", n=2, seconds=120.0)
+    lib = synthetic_library(tmp_path / "lib", n=2, seconds=70.0)
     db_path = str(tmp_path / "n.db")
     with open_db(db_path) as db:
         run_index(db, lib, workers=1, progress_stream=None)

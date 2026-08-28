@@ -79,11 +79,11 @@ def _files_without_envelope(db_path: str) -> list[tuple]:
 
 @pytest.fixture
 def tone_db(tmp_path) -> tuple[str, str]:
-    lib = synthetic_library(tmp_path / "lib", n=4, seconds=6.0)
+    lib = synthetic_library(tmp_path / "lib", n=3, seconds=4.0)
     db_path = str(tmp_path / "tones.db")
     with open_db(db_path) as db:
         summary = run_index(db, lib, workers=1, progress_stream=None)
-    assert summary["indexed"] == 4 and summary["errors"] == 0
+    assert summary["indexed"] == 3 and summary["errors"] == 0
     return lib, db_path
 
 
@@ -98,10 +98,10 @@ def test_indexing_stores_an_envelope_for_every_file(tone_db):
         assert db.count_missing_envelopes() == 0
         assert db.stats()["files_no_envelope"] == 0
         rows = list(db.iter_envelopes())
-        assert len(rows) == 4
+        assert len(rows) == 3
         for row in rows:
-            # 6-second files: 6 one-second samples.
-            assert row.envelope.size == 6
+            # 4-second files: 4 one-second samples.
+            assert row.envelope.size == 4
             assert row.envelope.dtype == np.uint8
 
 
@@ -134,7 +134,7 @@ def test_backfill_fills_only_the_missing_rows_and_rewrites_nothing_else(
     files_before = _files_without_envelope(db_path)
 
     # Simulate a database written before the envelope existed, for two of the
-    # four files only.
+    # three files only.
     con = sqlite3.connect(db_path)
     victims = [r[0] for r in con.execute(
         "SELECT path FROM files ORDER BY path LIMIT 2")]
@@ -177,9 +177,9 @@ def test_backfill_is_resumable(tone_db):
         fid, _p, _s, _m = db.files_missing_envelope()[0]
         db.set_envelope(fid, np.array([1, 2, 3], dtype=np.uint8))
         db.commit()
-        assert db.count_missing_envelopes() == 3
+        assert db.count_missing_envelopes() == 2
         summary = run_backfill(db, workers=1, progress_stream=None)
-    assert summary["considered"] == 3 and summary["filled"] == 3
+    assert summary["considered"] == 2 and summary["filled"] == 2
     with open_db(db_path, create=False) as db:
         assert db.count_missing_envelopes() == 0
 
@@ -200,7 +200,7 @@ def test_backfill_skips_a_file_that_changed_since_it_was_indexed(tone_db):
         summary = run_backfill(db, workers=1, progress_stream=None,
                                log=logged.append)
     assert summary["changed"] == 1
-    assert summary["filled"] == 3
+    assert summary["filled"] == 2
     assert any("changed since it was indexed" in m for m in logged)
     # The stale row keeps its NULL: an envelope computed from audio the
     # landmarks were not computed from would be worse than none.
@@ -220,7 +220,7 @@ def test_backfill_skips_a_vanished_file(tone_db, tmp_path):
     with open_db(db_path, create=False) as db:
         summary = run_backfill(db, workers=1, progress_stream=None,
                                log=logged.append)
-    assert summary["missing"] == 1 and summary["filled"] == 3
+    assert summary["missing"] == 1 and summary["filled"] == 2
     assert any("no longer exists" in m for m in logged)
 
 
@@ -324,8 +324,8 @@ def test_backfill_subcommand(tone_db, capsys):
 
     assert main(["--db", db_path, "backfill", "--workers", "2"]) == 0
     err = capsys.readouterr().err
-    assert "4 indexed file(s) need an activity envelope" in err
-    assert "filled 4 envelope(s)" in err
+    assert "3 indexed file(s) need an activity envelope" in err
+    assert "filled 3 envelope(s)" in err
 
     with open_db(db_path, create=False) as db:
         assert db.count_missing_envelopes() == 0

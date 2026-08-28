@@ -812,7 +812,7 @@ cannot know what the columns it does not have are supposed to contain.
 
 ```bash
 pip install pytest
-python3 -m pytest tests/          # ~5 minutes once the excerpt cache is warm
+python3 -m pytest tests/          # 115 tests, ~6 minutes warm
 ```
 
 The suite runs against the **real** recovered DR-40 corpus in
@@ -823,3 +823,9 @@ corpus is not present those tests skip and the pure unit tests still run.
 The first run is much slower than later ones: it cuts every excerpt it needs
 (including four ten-minute pairs for mode 3, ~1.4 GB) and caches them. Point
 `AUDIOMATCH_TEST_DIR` somewhere with a couple of gigabytes free.
+
+Mode 3's tests are the expensive half, and unavoidably so: the envelope is a
+1 Hz signal, so demonstrating anything about it needs ten-minute seeds rather
+than the 150 s that is plenty for the constellation. The four ground-truth
+queries share one set of seed analyses (a module-scoped fixture) for that
+reason.
