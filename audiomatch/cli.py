@@ -348,8 +348,9 @@ def cmd_purge(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="audio-match",
-        description="Find the same audio, and the same recording session, "
-                    "in a large library of audio files.")
+        description="Find the same audio, the same recording session, and "
+                    "other files that captured the same stretch of time, in "
+                    "a large library of audio files.")
     p.add_argument("--version", action="version",
                    version=f"audio-match {__version__}")
     p.add_argument("--db", default=config.DEFAULT_DB,
@@ -392,8 +393,8 @@ def build_parser() -> argparse.ArgumentParser:
                          "to catch a seed whose header lies about its sample "
                          "rate (3x slower; off by default)")
     pq.add_argument("--ignore-filenames", action="store_true",
-                    help="score mode 2 on audio evidence only, ignoring "
-                         "Tascam take numbers parsed from filenames")
+                    help="score modes 2 and 3 on audio evidence only, "
+                         "ignoring Tascam take numbers parsed from filenames")
     pq.set_defaults(func=cmd_query)
 
     pb = sub.add_parser(

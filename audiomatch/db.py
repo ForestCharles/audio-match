@@ -204,7 +204,16 @@ class Database:
             columns = {r[1] for r in
                        self.conn.execute("PRAGMA table_info(files)")}
             if "envelope" not in columns:
-                self.conn.execute("ALTER TABLE files ADD COLUMN envelope BLOB")
+                try:
+                    self.conn.execute(
+                        "ALTER TABLE files ADD COLUMN envelope BLOB")
+                except sqlite3.OperationalError as exc:
+                    # Another process migrated the same database between our
+                    # PRAGMA and our ALTER -- e.g. a query run while `index`
+                    # or `backfill` is opening it.  The column it added is the
+                    # column we wanted, so this is success, not failure.
+                    if "duplicate column" not in str(exc).lower():
+                        raise
 
         if stored is None or version != config.STORAGE_VERSION:
             self._set_meta("storage_version", str(config.STORAGE_VERSION))

@@ -658,13 +658,21 @@ def pair_search(db: Database, seed_path: str, *, top: int = 10,
 
     # -- evidence 2: constellation coherence, for the top candidates only.
     #
+    # "Top candidates" means *every candidate that will be reported* --
+    # ``chosen``, which is already capped at ``max(top,
+    # PAIR_COHERENCE_CANDIDATES)``.  Capping the coherence set at 20 while
+    # ``--top 25`` reported 25 made the 21st hit say "acoustic coherence:
+    # none -- consistent with a capture on different equipment", which is a
+    # claim about landmarks that were never looked at.  A verdict line may
+    # only report evidence that was actually sought.
+    #
     # The posting lookup restricts *results* to the candidate ids but still
     # applies MAX_POSTINGS_PER_HASH across the whole library, exactly as mode 1
     # does.  That is deliberate: a hash that occurs in thousands of files is
     # hum or hiss, and it says nothing about these two files just because only
     # two of them are being looked at right now.
     coherence: dict[int, Coherence] = {}
-    ids = {rows[i].id for i in chosen[:config.PAIR_COHERENCE_CANDIDATES]}
+    ids = {rows[i].id for i in chosen}
     seed_frames = int(round(seed.seconds * config.FRAME_RATE))
     if seed.hashes.size and ids:
         h, t = seed.hashes, seed.times

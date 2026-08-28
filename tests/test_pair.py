@@ -308,6 +308,53 @@ def test_unrelated_sessions_never_reach_likely_pair(pair_results,
     assert scores[-1][0] < config.PAIR_R_LIKELY, scores[-1]
 
 
+@requires_corpus
+def test_every_reported_hit_gets_the_coherence_pass(pair_db, pair_corpus,
+                                                    tmp_path):
+    """``--top`` above ``PAIR_COHERENCE_CANDIDATES`` must not report an
+    absence of evidence that was never sought.
+
+    The coherence set used to be capped at 20 while ``--top 25`` reported 25,
+    so the 21st hit printed "acoustic coherence: none -- consistent with a
+    capture on different equipment" for a file whose landmarks had not been
+    looked at once.  Here the seed's own envelope is planted in 20 decoy rows
+    so that they outrank the real dual-record mate, which then has to be
+    reported at rank 21 *with* its (strong) coherence.
+    """
+    import shutil
+    import sqlite3
+
+    from audiomatch.analyze import analyze_seed_full
+
+    db_path = str(tmp_path / "padded.db")
+    shutil.copy(pair_db, db_path)
+    seed = pair_corpus.seed_file("0077")
+    codes = analyze_seed_full(seed).envelope
+
+    con = sqlite3.connect(db_path)
+    con.executemany(
+        "INSERT INTO files(path, alive, size, mtime, status, error, duration,"
+        " sample_rate, channels, bits, codec, take, role, n_hashes, noise,"
+        " hum, chan, envelope, indexed_at) "
+        "VALUES(?,1,0,0,'ok',NULL,?,44100,2,24,'pcm_s24le',NULL,NULL,0,"
+        "?,?,?,?,0)",
+        [(f"/decoy/pad{i:02d}.wav", float(codes.size), b"", b"", b"",
+          codes.tobytes())
+         for i in range(config.PAIR_COHERENCE_CANDIDATES)])
+    con.commit()
+    con.close()
+
+    hits, _s, _sig, note = _search(db_path, seed,
+                                   top=config.PAIR_COHERENCE_CANDIDATES + 5)
+    assert not note, note
+    mate = os.path.basename(pair_corpus.lib_file("0077"))
+    rank = [i for i, h in enumerate(hits)
+            if os.path.basename(h.path) == mate]
+    assert rank, _report(hits)
+    assert rank[0] >= config.PAIR_COHERENCE_CANDIDATES, _report(hits)
+    assert hits[rank[0]].coherence.level == "strong", _report(hits)
+
+
 # --------------------------------------------------------------------------
 # 4. Short and degenerate seeds
 # --------------------------------------------------------------------------

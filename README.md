@@ -464,10 +464,12 @@ happen by chance, so it promotes a merely-plausible envelope score; but it can
 never rescue an envelope that disagrees about the timeline.
 
 Candidates are *generated* by envelope score alone — everything is correlated,
-the top 20 get the coherence pass — but they are *reported* verdict first, then
-by score. A file whose landmarks fall on a drifting line with the seed is as
-close to proof as this tool gets, and burying it under a slightly higher
-envelope score with nothing behind it would be the wrong way round.
+and everything that will be reported (at least the top 20) gets the coherence
+pass, so no hit ever says "coherence: none" about landmarks nobody looked at.
+But they are *reported* verdict first, then by score. A file whose landmarks
+fall on a drifting line with the seed is as close to proof as this tool gets,
+and burying it under a slightly higher envelope score with nothing behind it
+would be the wrong way round.
 
 The thresholds come from the measurements above. The unrelated set is the
 *hardest* negative class available — the same band, the same recorder, the same

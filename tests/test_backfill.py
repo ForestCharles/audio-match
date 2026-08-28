@@ -286,6 +286,64 @@ def test_a_v1_database_migrates_in_place_and_does_not_demand_a_reindex(
         assert db.count_missing_envelopes() == 1
 
 
+def test_two_processes_migrating_the_same_v1_database_do_not_collide(
+        tmp_path, monkeypatch):
+    """Opening a pre-v2 database twice at once must not crash either opener.
+
+    Realistically: ``audio-match query`` in one terminal while ``index`` or
+    ``backfill`` is starting up in another, on a database that has not been
+    migrated yet.  Both run ``PRAGMA table_info`` (no envelope), both then run
+    the ``ALTER``, and the loser used to die with ``sqlite3.OperationalError:
+    duplicate column name: envelope``.  The column the winner added is the
+    column the loser wanted, so that is success.
+
+    The race is reproduced deterministically: the other process's ALTER is
+    injected after *this* process has already read the column list.
+    """
+    import audiomatch.db as dbmod
+
+    db_path = str(tmp_path / "v1.db")
+    con = sqlite3.connect(db_path)
+    con.executescript(V1_SCHEMA)
+    con.execute("INSERT INTO meta(key, value) VALUES('schema_version', ?)",
+                (str(config.SCHEMA_VERSION),))
+    con.commit()
+    con.close()
+
+    real_connect = sqlite3.connect
+
+    class _LosesTheRace:
+        """Proxies the connection, letting the *other* process win once."""
+
+        def __init__(self, conn):
+            self._conn = conn
+            self._raced = False
+
+        def execute(self, sql, *args):
+            cur = self._conn.execute(sql, *args)
+            if "PRAGMA table_info(files)" in sql and not self._raced:
+                self._raced = True
+                rows = cur.fetchall()          # our probe: no envelope column
+                other = real_connect(db_path)
+                other.execute("ALTER TABLE files ADD COLUMN envelope BLOB")
+                other.commit()
+                other.close()
+                return iter(rows)
+            return cur
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    monkeypatch.setattr(
+        dbmod.sqlite3, "connect",
+        lambda *a, **k: _LosesTheRace(real_connect(*a, **k)))
+
+    with open_db(db_path, create=False) as db:     # must not raise
+        cols = {r[1] for r in db.conn.execute("PRAGMA table_info(files)")}
+        assert "envelope" in cols
+        assert db._meta("storage_version") == str(config.STORAGE_VERSION)
+
+
 def test_a_future_storage_version_is_refused_with_a_useful_message(tmp_path):
     db_path = str(tmp_path / "future.db")
     open_db(db_path).close()
