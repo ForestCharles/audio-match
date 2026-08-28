@@ -1,5 +1,16 @@
 """SQLite storage.
 
+Two versions, deliberately
+--------------------------
+``config.SCHEMA_VERSION`` means "the stored fingerprints themselves changed":
+the only cure is deleting the database and re-indexing, and that is what the
+error says.  ``config.STORAGE_VERSION`` means "the table layout grew something
+new that the existing fingerprints are still valid under".  Storage upgrades
+are applied in place by :meth:`Database._migrate` -- an additive
+``ALTER TABLE`` -- because telling somebody to re-read 1.45 TB to gain a column
+that a 3x cheaper decode could fill would be a lie.  ``audio-match backfill``
+fills the new column for the rows that predate it.
+
 Layout notes
 ------------
 ``hashes`` is a ``WITHOUT ROWID`` table whose primary key *is* the whole row,
@@ -25,6 +36,7 @@ from typing import Iterator, Optional, Sequence
 import numpy as np
 
 from . import config
+from .envelope import pack as envelope_blob, unpack as envelope_unblob
 from .session import Signature
 
 SCHEMA = """
@@ -55,6 +67,8 @@ CREATE TABLE IF NOT EXISTS files (
     noise        BLOB,
     hum          BLOB,
     chan         BLOB,
+    envelope     BLOB,            -- uint8 1 Hz activity envelope; NULL = never
+                                  -- computed (pre-v2 row) -> run 'backfill'
     indexed_at   REAL
 );
 
@@ -99,6 +113,18 @@ class FileRow:
         )
 
 
+@dataclass
+class EnvelopeRow:
+    """A library file's activity envelope, plus what pair mode needs with it."""
+
+    id: int
+    path: str
+    duration: float
+    take: Optional[int]
+    role: Optional[str]
+    envelope: np.ndarray        # uint8 codes; dequantise for correlation
+
+
 def _blob(a: Optional[np.ndarray]) -> bytes:
     if a is None:
         return b""
@@ -128,24 +154,59 @@ class Database:
         self.conn = sqlite3.connect(path, timeout=120.0)
         self.conn.executescript(SCHEMA)
         self._check_version()
+        self._migrate()
 
     # -- lifecycle ---------------------------------------------------------
 
+    def _meta(self, key: str) -> Optional[str]:
+        row = self.conn.execute(
+            "SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return None if row is None else str(row[0])
+
+    def _set_meta(self, key: str, value: str) -> None:
+        self.conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value))
+
     def _check_version(self) -> None:
-        cur = self.conn.execute(
-            "SELECT value FROM meta WHERE key = 'schema_version'")
-        row = cur.fetchone()
-        if row is None:
-            self.conn.execute(
-                "INSERT INTO meta(key, value) VALUES('schema_version', ?)",
-                (str(config.SCHEMA_VERSION),))
+        stored = self._meta("schema_version")
+        if stored is None:
+            self._set_meta("schema_version", str(config.SCHEMA_VERSION))
             self.conn.commit()
             return
-        if int(row[0]) != config.SCHEMA_VERSION:
+        if int(stored) != config.SCHEMA_VERSION:
             raise RuntimeError(
                 f"database {self.path!r} was built by fingerprint schema "
-                f"v{row[0]}, this build is v{config.SCHEMA_VERSION}. "
+                f"v{stored}, this build is v{config.SCHEMA_VERSION}. "
                 f"Delete it and re-index.")
+
+    def _migrate(self) -> None:
+        """Bring an older *storage* layout up to date, in place.
+
+        Additive only.  Every migration here must leave the landmarks and the
+        session signatures byte-identical -- if a change cannot promise that,
+        it belongs behind ``SCHEMA_VERSION`` and a re-index instead.
+        """
+        stored = self._meta("storage_version")
+        version = int(stored) if stored is not None else 1
+        if version > config.STORAGE_VERSION:
+            raise RuntimeError(
+                f"database {self.path!r} uses storage layout v{version}, "
+                f"newer than this build's v{config.STORAGE_VERSION}. "
+                f"Upgrade audio-match, or delete the database and re-index.")
+
+        if version < 2:
+            # v2: the 1 Hz activity envelope used by pair mode.  Existing rows
+            # get NULL, which is exactly what `audio-match backfill` looks for.
+            columns = {r[1] for r in
+                       self.conn.execute("PRAGMA table_info(files)")}
+            if "envelope" not in columns:
+                self.conn.execute("ALTER TABLE files ADD COLUMN envelope BLOB")
+
+        if stored is None or version != config.STORAGE_VERSION:
+            self._set_meta("storage_version", str(config.STORAGE_VERSION))
+            self.conn.commit()
 
     def close(self) -> None:
         try:
@@ -204,14 +265,20 @@ class Database:
                  sample_rate: int, channels: int, bits: int, codec: str,
                  sig: Optional[Signature],
                  hashes: Optional[np.ndarray] = None,
-                 times: Optional[np.ndarray] = None) -> int:
+                 times: Optional[np.ndarray] = None,
+                 envelope: Optional[np.ndarray] = None) -> int:
         self.retire(path)
         n_hashes = int(hashes.size) if hashes is not None else 0
+        # ``None`` stores SQL NULL, which means "nobody has computed this
+        # file's envelope yet" and is what `backfill` selects on.  An empty
+        # array stores a zero-length blob, which means "computed, and there
+        # was nothing there" -- a different fact, and not a backfill candidate.
+        env_blob = None if envelope is None else envelope_blob(envelope)
         cur = self.conn.execute(
             "INSERT INTO files(path, alive, size, mtime, status, error, "
             " duration, sample_rate, channels, bits, codec, take, role, "
-            " n_hashes, noise, hum, chan, indexed_at) "
-            "VALUES(?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " n_hashes, noise, hum, chan, envelope, indexed_at) "
+            "VALUES(?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (path, size, mtime, status, error, probe_duration, sample_rate,
              channels, bits, codec,
              sig.take if sig else None, sig.role if sig else None,
@@ -219,6 +286,7 @@ class Database:
              _blob(sig.noise if sig else None),
              _blob(sig.hum if sig else None),
              _blob(sig.chan if sig else None),
+             env_blob,
              time.time()))
         file_id = int(cur.lastrowid)
         if hashes is not None and times is not None and hashes.size:
@@ -230,28 +298,93 @@ class Database:
                     times.tolist()))
         return file_id
 
+    def set_envelope(self, file_id: int, envelope: np.ndarray) -> None:
+        """Fill in one row's envelope and touch *nothing else*.
+
+        Backfill must not disturb ``size``, ``mtime``, ``n_hashes`` or a single
+        landmark: a database that has been backfilled has to be byte-identical
+        to one that was indexed with the envelope from the start, apart from
+        this column.  Hence a targeted UPDATE rather than a re-``add_file``.
+        """
+        self.conn.execute("UPDATE files SET envelope = ? WHERE id = ?",
+                          (envelope_blob(envelope), int(file_id)))
+
     def commit(self) -> None:
         self.conn.commit()
 
     # -- reads -------------------------------------------------------------
 
+    _FILE_COLUMNS = ("id, path, size, mtime, status, error, duration, "
+                     "sample_rate, channels, bits, codec, take, role, "
+                     "n_hashes, noise, hum, chan")
+
+    @staticmethod
+    def _file_row(r: tuple) -> FileRow:
+        return FileRow(
+            id=int(r[0]), path=r[1], size=int(r[2] or 0),
+            mtime=float(r[3] or 0.0), status=r[4], error=r[5],
+            duration=float(r[6] or 0.0), sample_rate=int(r[7] or 0),
+            channels=int(r[8] or 0), bits=int(r[9] or 0),
+            codec=r[10] or "?", take=r[11], role=r[12],
+            n_hashes=int(r[13] or 0),
+            noise=_unblob(r[14], config.NOISE_BANDS),
+            hum=_unblob(r[15], config.HUM_DIM),
+            chan=_unblob(r[16], config.CHAN_DIM))
+
     def live_files(self, status: str = "ok") -> Iterator[FileRow]:
         cur = self.conn.execute(
-            "SELECT id, path, size, mtime, status, error, duration, "
-            "sample_rate, channels, bits, codec, take, role, n_hashes, "
-            "noise, hum, chan FROM files WHERE alive = 1 AND status = ?",
-            (status,))
+            f"SELECT {self._FILE_COLUMNS} FROM files "
+            f"WHERE alive = 1 AND status = ?", (status,))
         for r in cur:
-            yield FileRow(
-                id=int(r[0]), path=r[1], size=int(r[2] or 0),
-                mtime=float(r[3] or 0.0), status=r[4], error=r[5],
-                duration=float(r[6] or 0.0), sample_rate=int(r[7] or 0),
-                channels=int(r[8] or 0), bits=int(r[9] or 0),
-                codec=r[10] or "?", take=r[11], role=r[12],
-                n_hashes=int(r[13] or 0),
-                noise=_unblob(r[14], config.NOISE_BANDS),
-                hum=_unblob(r[15], config.HUM_DIM),
-                chan=_unblob(r[16], config.CHAN_DIM))
+            yield self._file_row(r)
+
+    def file_row(self, file_id: int) -> Optional[FileRow]:
+        """One file by id.  A primary-key lookup, for the handful of rows a
+        pair query actually reports -- a full ``live_files()`` scan to read
+        twenty signatures would be silly on a 2500-hour index."""
+        r = self.conn.execute(
+            f"SELECT {self._FILE_COLUMNS} FROM files WHERE id = ?",
+            (int(file_id),)).fetchone()
+        return None if r is None else self._file_row(r)
+
+    def files_missing_envelope(self) -> list[tuple[int, str, int, float]]:
+        """``(id, path, size, mtime)`` for every live, OK row with no envelope.
+
+        Only ``status='ok'`` rows: a file that could not be decoded when it was
+        indexed will not decode now either, and re-attempting it on every
+        backfill run would turn a resumable pass into an unbounded one.
+        ``--retry-errors`` on ``index`` is the right tool for those.
+        """
+        cur = self.conn.execute(
+            "SELECT id, path, size, mtime FROM files "
+            "WHERE alive = 1 AND status = 'ok' AND envelope IS NULL "
+            "ORDER BY path")
+        return [(int(r[0]), r[1], int(r[2] or 0), float(r[3] or 0.0))
+                for r in cur]
+
+    def count_missing_envelopes(self) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM files WHERE alive = 1 AND status = 'ok' "
+            "AND envelope IS NULL").fetchone()
+        return int(row[0] or 0)
+
+    def iter_envelopes(self) -> Iterator["EnvelopeRow"]:
+        """Every live, OK file that has an envelope, with it decoded to dB.
+
+        One byte per second means a 2500-hour library is ~9 MB of envelope in
+        total, so pair mode can afford to hold all of them at once and hand the
+        whole set to one batched FFT.
+        """
+        cur = self.conn.execute(
+            "SELECT id, path, duration, take, role, envelope FROM files "
+            "WHERE alive = 1 AND status = 'ok' AND envelope IS NOT NULL")
+        for r in cur:
+            codes = envelope_unblob(r[5])
+            if codes.size == 0:
+                continue
+            yield EnvelopeRow(id=int(r[0]), path=r[1],
+                              duration=float(r[2] or 0.0),
+                              take=r[3], role=r[4], envelope=codes)
 
     def file_paths(self) -> dict[int, str]:
         cur = self.conn.execute(
@@ -345,6 +478,9 @@ class Database:
             "files_error": one("SELECT COUNT(*) FROM files "
                                "WHERE alive=1 AND status='error'"),
             "files_dead": one("SELECT COUNT(*) FROM files WHERE alive=0"),
+            "files_no_envelope": one(
+                "SELECT COUNT(*) FROM files WHERE alive=1 AND status='ok' "
+                "AND envelope IS NULL"),
             "hashes": one("SELECT COUNT(*) FROM hashes"),
             "seconds": int(one(
                 "SELECT CAST(COALESCE(SUM(duration),0) AS INTEGER) "

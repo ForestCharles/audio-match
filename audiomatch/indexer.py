@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from typing import Callable, Iterator, Optional
 
 from . import config
-from .analyze import Analysis, analyze_file
+from .analyze import Analysis, analyze_file, envelope_file
 from .db import Database
 
 
@@ -192,6 +192,17 @@ def _worker(path: str) -> Analysis:
                         error=f"worker crashed: {exc!r}")
 
 
+def _envelope_worker(path: str) -> Analysis:
+    victim = os.environ.get(KILL_ENV)
+    if victim and os.path.basename(path) == victim:
+        os.kill(os.getpid(), signal.SIGKILL)      # pragma: no cover
+    try:
+        return envelope_file(path)
+    except BaseException as exc:                  # pragma: no cover
+        return Analysis(path=path, size=0, mtime=0.0, status="error",
+                        error=f"worker crashed: {exc!r}")
+
+
 class WorkerDied(RuntimeError):
     """Raised internally when the process pool breaks."""
 
@@ -251,7 +262,8 @@ def run_index(db: Database, root: str, *, workers: int = 0,
                     status=an.status, error=an.error,
                     probe_duration=an.duration, sample_rate=an.sample_rate,
                     channels=an.channels, bits=an.bits, codec=an.codec,
-                    sig=an.signature, hashes=an.hashes, times=an.times)
+                    sig=an.signature, hashes=an.hashes, times=an.times,
+                    envelope=an.envelope)
         summary["hashes"] += an.n_hashes
         if an.status == "ok":
             summary["indexed"] += 1
@@ -297,8 +309,13 @@ INFLIGHT_PER_WORKER = 4
 
 
 def _run_pool(todo: list[str], n_workers: int,
-              consume: Callable[[Analysis], None]) -> None:
+              consume: Callable[[Analysis], None],
+              fn: Callable[[str], Analysis] = _worker) -> None:
     """Fan ``todo`` out over a process pool, feeding results to ``consume``.
+
+    ``fn`` must be a module-level function: workers are *spawned*, so the task
+    is pickled by qualified name and a closure or a lambda would not survive
+    the trip.
 
     Raises :class:`WorkerDied` if a worker process disappears (SIGKILL, OOM
     killer, segfault) instead of hanging forever, which is what
@@ -310,7 +327,7 @@ def _run_pool(todo: list[str], n_workers: int,
         with ProcessPoolExecutor(max_workers=n_workers,
                                  mp_context=ctx) as pool:
             window = n_workers * INFLIGHT_PER_WORKER
-            futures = {pool.submit(_worker, p)
+            futures = {pool.submit(fn, p)
                        for p in itertools.islice(pending, window)}
             while futures:
                 done, futures = wait(futures, return_when=FIRST_COMPLETED)
@@ -326,8 +343,112 @@ def _run_pool(todo: list[str], n_workers: int,
                     for fut in futures:
                         fut.cancel()
                     raise WorkerDied(str(broken)) from broken
-                futures |= {pool.submit(_worker, p)
+                futures |= {pool.submit(fn, p)
                             for p in itertools.islice(pending, len(done))}
     except BrokenProcessPool as exc:
         # The executor's own shutdown can surface the breakage too.
         raise WorkerDied(str(exc)) from exc
+
+
+# --------------------------------------------------------------------------
+# Backfill: fill in the activity envelope on a database that predates it
+# --------------------------------------------------------------------------
+
+
+def run_backfill(db: Database, *, workers: int = 0,
+                 progress_stream=sys.stderr,
+                 log: Optional[Callable[[str], None]] = None) -> dict:
+    """Compute the 1 Hz envelope for every indexed file that lacks one.
+
+    Reuses the index pass's worker pool, progress line and commit batching, so
+    it is interruptible and resumable in exactly the same way: the work list is
+    "rows whose ``envelope`` is NULL", which shrinks as the run commits, so a
+    rerun picks up where the last one stopped with no extra bookkeeping.
+
+    Files that already have an envelope are never opened.  Landmarks, session
+    signatures, sizes and mtimes are never rewritten -- only the one column.
+
+    A file whose ``(size, mtime)`` no longer matches the row is *skipped*, not
+    filled: its audio has changed since it was fingerprinted, so an envelope
+    computed now would describe different audio from the landmarks beside it.
+    ``audio-match index`` is the command that resolves that, and the summary
+    says so.
+    """
+    log = log or (lambda msg: None)
+    todo = db.files_missing_envelope()
+    summary = {"filled": 0, "errors": 0, "changed": 0, "missing": 0,
+               "bytes": 0, "seconds": 0.0, "aborted": False,
+               "considered": len(todo)}
+    if not todo:
+        log("backfill: every indexed file already has an activity envelope")
+        return summary
+
+    by_path = {path: (fid, size, mtime) for fid, path, size, mtime in todo}
+    paths: list[str] = []
+    total_bytes = 0
+    for fid, path, size, mtime in todo:
+        try:
+            st = os.stat(path)
+        except OSError:
+            summary["missing"] += 1
+            log(f"  GONE  {path}: no longer exists; run 'audio-match index' "
+                f"on its library root to prune it")
+            continue
+        if st.st_size != size or abs(st.st_mtime - mtime) >= 1e-6:
+            summary["changed"] += 1
+            log(f"  STALE {path}: changed since it was indexed; re-run "
+                f"'audio-match index' instead")
+            continue
+        paths.append(path)
+        total_bytes += st.st_size
+
+    log(f"backfill: {len(paths):,} file(s) to decode, "
+        f"{_fmt_bytes(total_bytes)} to read "
+        f"({summary['considered'] - len(paths):,} skipped)")
+    if not paths:
+        return summary
+
+    n_workers = workers if workers and workers > 0 else (os.cpu_count() or 1)
+    n_workers = max(1, min(n_workers, len(paths)))
+    db.begin_bulk()
+    progress = Progress(len(paths), total_bytes, progress_stream)
+    t0 = time.time()
+    pending = 0
+
+    def consume(an: Analysis) -> None:
+        nonlocal pending
+        entry = by_path.get(an.path)
+        if an.status == "ok" and an.envelope is not None and entry is not None:
+            db.set_envelope(entry[0], an.envelope)
+            summary["filled"] += 1
+            if an.error:
+                log(f"  WARN  {an.path}: {an.error}")
+        else:
+            summary["errors"] += 1
+            log(f"  ERROR {an.path}: {an.error}")
+        summary["bytes"] += an.size
+        pending += 1
+        if pending >= config.COMMIT_EVERY:
+            db.commit()
+            pending = 0
+        progress.update(an)
+
+    try:
+        if n_workers == 1:
+            for path in paths:
+                consume(_envelope_worker(path))
+        else:
+            _run_pool(paths, n_workers, consume, fn=_envelope_worker)
+    except KeyboardInterrupt:
+        log("\ninterrupted -- committing what is done; rerun to resume")
+    except WorkerDied:
+        summary["aborted"] = True
+    finally:
+        db.commit()
+        progress.finish()
+
+    if summary["aborted"]:
+        log(WORKER_DIED_MESSAGE.replace("`audio-match index`",
+                                        "`audio-match backfill`"))
+    summary["seconds"] = time.time() - t0
+    return summary

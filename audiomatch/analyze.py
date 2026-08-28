@@ -1,9 +1,14 @@
-"""Single-file analysis: one decode, both fingerprints.
+"""Single-file analysis: one decode, all three signatures.
 
 This is the unit of work handed to the multiprocessing pool.  It reads each
 file from disk exactly once (the 1.45 TB read is the bottleneck of the whole
 tool, so reading twice would literally double the wall-clock time) and streams
 the decode so that memory stays flat no matter how long the file is.
+
+The one decode feeds three consumers: the constellation (mode 1), the session
+signature (mode 2) and the activity envelope (mode 3).  Adding the envelope
+cost one extra pass over the mono block that was already in registers -- a
+sum of squares -- and no extra IO at all.
 """
 
 from __future__ import annotations
@@ -14,7 +19,7 @@ from typing import Optional
 
 import numpy as np
 
-from . import audio, config, fingerprint
+from . import audio, config, envelope as env, fingerprint
 from .session import RegionCollector, Signature, signature_from_regions
 
 
@@ -33,6 +38,10 @@ class Analysis:
     signature: Optional[Signature] = None
     hashes: Optional[np.ndarray] = None
     times: Optional[np.ndarray] = None
+    #: uint8 activity envelope.  ``None`` means "not computed" (which
+    #: ``analyze_file`` never returns for an ``ok`` file); an empty array means
+    #: "computed, nothing there".
+    envelope: Optional[np.ndarray] = None
     decoded_bytes: int = 0
 
     @property
@@ -75,13 +84,16 @@ def analyze_file(path: str, *,
     tracker = fingerprint.BandTracker()
     stft = fingerprint._StftStreamer()
     regions = RegionCollector(p.duration)
+    envelope = env.EnvelopeCollector()
     n_samples = 0
     try:
         for block in audio.decode_stream(path, rate=config.ANALYSIS_SR,
                                          channels=2):
             n_samples += block.shape[0]
             regions.push(block)
-            tracker.push_spectrogram(stft.push(audio.to_mono(block)))
+            mono = audio.to_mono(block)
+            envelope.push(mono)
+            tracker.push_spectrogram(stft.push(mono))
     except audio.AudioError as exc:
         if n_samples == 0:
             base.error = f"decode failed: {exc}"
@@ -117,12 +129,71 @@ def analyze_file(path: str, *,
     base.signature = sig
     base.hashes = h
     base.times = t
+    base.envelope = envelope.result()
     base.decoded_bytes = size
     return base
 
 
-def analyze_seed(path: str, *, rate_ratio: float = 1.0
-                 ) -> tuple[np.ndarray, np.ndarray, Signature, float]:
+def envelope_file(path: str) -> Analysis:
+    """Compute *only* the activity envelope for an already-indexed file.
+
+    This is what ``audio-match backfill`` runs.  It exists so that a database
+    built before the envelope column can be upgraded without recomputing a
+    single landmark: the decode is the same, but there is no STFT, no peak
+    picking, no hashing and no session signature, which makes it roughly three
+    times cheaper per byte than a full :func:`analyze_file`.
+
+    The returned :class:`Analysis` carries ``size``/``mtime`` so the caller can
+    check the file has not changed since it was indexed; everything else is
+    left unset, and the caller must not write it back to the row.
+    """
+    try:
+        st = os.stat(path)
+        size, mtime = int(st.st_size), float(st.st_mtime)
+    except OSError as exc:
+        return Analysis(path=path, size=0, mtime=0.0, status="error",
+                        error=f"stat failed: {exc}")
+
+    base = Analysis(path=path, size=size, mtime=mtime, status="error")
+    collector = env.EnvelopeCollector()
+    n_samples = 0
+    try:
+        for block in audio.decode_stream(path, rate=config.ANALYSIS_SR,
+                                         channels=2):
+            n_samples += block.shape[0]
+            collector.push(audio.to_mono(block))
+    except audio.AudioError as exc:
+        if n_samples == 0:
+            base.error = f"decode failed: {exc}"
+            return base
+        base.error = f"decode ended early: {exc}"
+    except Exception as exc:                      # pragma: no cover - defensive
+        base.error = f"decode crashed: {exc!r}"
+        return base
+
+    if n_samples == 0:
+        base.error = base.error or "decoded to zero samples"
+        return base
+
+    base.status = "ok"
+    base.envelope = collector.result()
+    base.duration = n_samples / config.ANALYSIS_SR
+    base.decoded_bytes = size
+    return base
+
+
+@dataclass
+class SeedAnalysis:
+    """Everything one decode of a query seed produces."""
+
+    hashes: np.ndarray
+    times: np.ndarray
+    signature: Signature
+    seconds: float
+    envelope: np.ndarray
+
+
+def analyze_seed_full(path: str, *, rate_ratio: float = 1.0) -> SeedAnalysis:
     """Analyse a query seed, optionally with a sample-rate correction.
 
     ``rate_ratio`` < 1 decodes at a lower rate and then *interprets* the
@@ -135,11 +206,14 @@ def analyze_seed(path: str, *, rate_ratio: float = 1.0
     tracker = fingerprint.BandTracker()
     stft = fingerprint._StftStreamer()
     regions = RegionCollector(p.duration)
+    envelope = env.EnvelopeCollector()
     n = 0
     for block in audio.decode_stream(path, rate=decode_rate, channels=2):
         n += block.shape[0]
         regions.push(block)
-        tracker.push_spectrogram(stft.push(audio.to_mono(block)))
+        mono = audio.to_mono(block)
+        envelope.push(mono)
+        tracker.push_spectrogram(stft.push(mono))
     if n == 0:
         raise audio.AudioError("seed decoded to zero samples")
 
@@ -151,4 +225,13 @@ def analyze_seed(path: str, *, rate_ratio: float = 1.0
         regions.result(), rate=config.ANALYSIS_SR,
         sample_rate=p.sample_rate, channels=p.channels, bits=p.bits,
         duration=p.duration, filename=path)
-    return h, t, sig, seed_seconds
+    return SeedAnalysis(hashes=h, times=t, signature=sig,
+                        seconds=seed_seconds, envelope=envelope.result())
+
+
+def analyze_seed(path: str, *, rate_ratio: float = 1.0
+                 ) -> tuple[np.ndarray, np.ndarray, Signature, float]:
+    """:func:`analyze_seed_full`, as the ``(hashes, times, sig, seconds)``
+    tuple that modes 1 and 2 want."""
+    a = analyze_seed_full(path, rate_ratio=rate_ratio)
+    return a.hashes, a.times, a.signature, a.seconds

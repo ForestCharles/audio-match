@@ -10,7 +10,7 @@ from typing import Optional, Sequence
 from . import __version__, config
 from .audio import AudioError, require_ffmpeg
 from .db import open_db
-from .indexer import _fmt_bytes, _fmt_hms, run_index
+from .indexer import _fmt_bytes, _fmt_hms, run_backfill, run_index
 from .query import QueryResult, run_query
 from .session import SessionScore
 
@@ -184,6 +184,12 @@ def cmd_index(args: argparse.Namespace) -> int:
         print(f"note: {stats['files_dead']:,} superseded file record(s) still "
               "hold landmarks; run 'audio-match purge' to reclaim the space",
               file=sys.stderr)
+    if stats["files_no_envelope"]:
+        print(f"note: {stats['files_no_envelope']:,} file(s) indexed by an "
+              "older build have no activity envelope and are invisible to "
+              "'query --mode pair'; run 'audio-match backfill' once (it "
+              "decodes only those files and touches no fingerprints)",
+              file=sys.stderr)
     return 1 if summary["aborted"] else 0
 
 
@@ -217,6 +223,34 @@ def cmd_query(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_backfill(args: argparse.Namespace) -> int:
+    require_ffmpeg()
+    with open_db(args.db, create=False) as db:
+        missing = db.count_missing_envelopes()
+        print(f"database: {args.db}\n"
+              f"{missing:,} indexed file(s) need an activity envelope",
+              file=sys.stderr)
+        summary = run_backfill(
+            db, workers=args.workers,
+            progress_stream=None if args.quiet else sys.stderr,
+            log=(lambda m: None) if args.quiet
+            else (lambda m: print(m, file=sys.stderr)))
+        left = db.count_missing_envelopes()
+    secs = summary["seconds"]
+    print(f"\nfilled {summary['filled']:,} envelope(s), "
+          f"{summary['errors']:,} error(s), "
+          f"{summary['changed']:,} changed since indexing, "
+          f"{summary['missing']:,} vanished", file=sys.stderr)
+    if secs:
+        print(f"read {_fmt_bytes(summary['bytes'])} in {_fmt_hms(secs)}"
+              f" ({_fmt_bytes(summary['bytes'] / secs)}/s)", file=sys.stderr)
+    if left:
+        print(f"{left:,} file(s) still have no envelope; re-run 'audio-match "
+              f"index' on their library root if they changed on disk",
+              file=sys.stderr)
+    return 1 if summary["aborted"] else 0
+
+
 def cmd_stats(args: argparse.Namespace) -> int:
     with open_db(args.db, create=False) as db:
         s = db.stats()
@@ -227,6 +261,9 @@ def cmd_stats(args: argparse.Namespace) -> int:
     print(f"files superseded{s['files_dead']:,}")
     print(f"audio indexed   {_fmt_hms(s['seconds'])}")
     print(f"landmarks       {s['hashes']:,}")
+    print(f"no envelope     {s['files_no_envelope']:,}"
+          + ("   <- run 'audio-match backfill' for pair mode"
+             if s["files_no_envelope"] else ""))
     if s["seconds"]:
         print(f"db per hour     "
               f"{_fmt_bytes(s['bytes'] / (s['seconds'] / 3600.0))}")
@@ -303,6 +340,16 @@ def build_parser() -> argparse.ArgumentParser:
                     help="score mode 2 on audio evidence only, ignoring "
                          "Tascam take numbers parsed from filenames")
     pq.set_defaults(func=cmd_query)
+
+    pb = sub.add_parser(
+        "backfill",
+        help="compute the activity envelope for already-indexed files that "
+             "lack one (needed once for pair mode on an older database)")
+    pb.add_argument("--workers", type=int, default=0,
+                    help="worker processes (default: number of CPUs)")
+    pb.add_argument("--quiet", action="store_true",
+                    help="suppress progress output")
+    pb.set_defaults(func=cmd_backfill)
 
     ps = sub.add_parser("stats", help="show index statistics")
     ps.set_defaults(func=cmd_stats)
