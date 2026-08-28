@@ -277,7 +277,8 @@ PAIR_MIN_OVERLAP_FRACTION = 0.5
 
 #: Two soft penalties on top of that hard minimum.  Between them they are the
 #: single most important tuning decision in pair mode, so here is the
-#: measurement (all 9 recovered corpus files, whole, all 72 ordered pairs):
+#: measurement (8 recovered corpus files, whole; all 56 ordered pairs, of
+#: which 8 are true S12/S34 mates and 48 are unrelated):
 #:
 #:     statistic                       true pairs      unrelated pairs
 #:     raw best-lag Pearson r          0.913 .. 0.948  up to 0.911  (!)
@@ -326,15 +327,35 @@ PAIR_COHERENCE_WINDOW_SECONDS = 30.0
 #: histogram is recomputed with the seed timestamps pre-compensated by each
 #: candidate slope and the sharpest histogram wins.
 #:
-#: The grid is adaptive.  Two slopes are only distinguishable if they disagree
-#: by more than one STFT frame (23 ms) across the seed, so the step is
-#: ``max(PAIR_DRIFT_MIN_STEP_PPM, 2 frames worth)``: a 150-second seed gets
-#: only the zero slope (correctly -- 300 ppm over 150 s is 45 ms, two frames,
-#: nothing to fit), while a 45-minute seed gets the full 25 ppm grid.  The grid
-#: is capped at ``PAIR_MAX_DRIFT_SLOPES`` entries so the cost is bounded.
+#: The grid is adaptive, because the *resolution* of a drift estimate depends
+#: entirely on how long the seed is.  Two slopes are only distinguishable when
+#: they move votes by more than the width of a smoothed histogram bin --
+#: ``2 * OFFSET_SMOOTH + 1`` = 3 frames, 70 ms -- across the whole seed.  (An
+#: earlier version used *one* frame and was measurably wrong: on a 10-minute
+#: seed it produced a 15-slope grid whose vote counts differed by one, and it
+#: duly reported a confident +77 ppm for two files off the same crystal.)
+#:
+#:     seed length      step        slopes    total drift at 100 ppm
+#:     150 s             464 ppm    1 (zero)  6.5 ms  -- 0.3 bins
+#:     10 min            116 ppm    5         65 ms   -- 0.9 bins
+#:     45 min             26 ppm    23        270 ms  -- 3.9 bins
+#:
+#: The last column is the honest measure of what is knowable.  A drift only
+#: becomes *detectable* once it smears the peak across several bins, which
+#: needs tens of minutes; the corpus bears this out, with a real +104 ppm on a
+#: 10-minute seed recovering only 4% more votes than no compensation at all.
 PAIR_MAX_DRIFT_PPM = 300.0
 PAIR_DRIFT_MIN_STEP_PPM = 25.0
 PAIR_MAX_DRIFT_SLOPES = 25
+
+#: A non-zero slope must win at least this many times the zero slope's votes
+#: before it is believed.  Without it the fit reports whichever slope won by a
+#: single vote, which on real same-clock pairs was 1.009x -- noise dressed up
+#: as a measurement.  Calibrated against both ends: same-recorder S12/S34
+#: pairs peaked at 1.000x-1.009x, while a drift large enough to actually smear
+#: the histogram recovers its votes several-fold.  Between those, the tool
+#: says "no drift detected at this seed length" rather than guessing.
+PAIR_DRIFT_MIN_GAIN = 1.10
 
 #: Coherence verdicts.  The bars are the same shape as mode 1's (an absolute
 #: vote floor plus a sharpness floor) but lower, because a pair-mate is the
@@ -351,19 +372,24 @@ PAIR_COHERENCE_WEAK_SHARPNESS = 2.0
 #: Verdict thresholds on the penalised envelope correlation.  Measured on the
 #: whole recovered corpus (see ``PAIR_OVERLAP_EXPONENT`` for the method):
 #:
-#:     true S12/S34 pairs      0.887 .. 0.937   (n=8)
-#:     unrelated pairs         0.402 .. 0.585   (n=48, p90 0.54)
+#:                             whole files        10-minute excerpts
+#:     true S12/S34 pairs      0.887 .. 0.937     0.820 .. 0.921  (n=4)
+#:     unrelated pairs         0.402 .. 0.584     0.141 .. 0.620  (n=12)
 #:
 #: The unrelated set is the *hardest* available negative class -- the same
 #: band, the same rig, the same room, sets of similar length and shape on
-#: different days -- so 0.585 is a realistic ceiling for "no relationship",
-#: not a soft one.  LIKELY PAIR at 0.65 clears it with room; PAIR at 0.80 sits
-#: in the empty middle of a 0.30-wide gap.
+#: different days -- so those ceilings are realistic rather than flattering.
+#: PAIR at 0.80 sits in empty space in both columns.  LIKELY PAIR at 0.65 has
+#: room on whole files and only 0.03 on excerpts, which is the thinnest margin
+#: anywhere in this mode and the reason the README tells people to seed with as
+#: much of the recording as they have.
 #:
-#: A degraded different-recorder capture lands between the two, which is
-#: exactly what LIKELY PAIR is for: the simulated second rig in the test suite
-#: (100 ppm resample, EQ tilt, echo, -6 dB, 128k mp3) still scores ~0.9 on the
-#: envelope while sharing almost no landmarks at all.
+#: A degraded different-recorder capture lands between the two, which is what
+#: LIKELY PAIR is for.  (The test suite's simulated second rig -- 104 ppm
+#: resample, EQ tilt, echo, -6 dB, 128k mp3 -- actually scores 0.871 and keeps
+#: its coherence, so it comes out PAIR; a real second rig across the room, with
+#: different capsules pointing somewhere else, is the harsher case this
+#: threshold is really aimed at.)
 PAIR_R_STRONG = 0.80
 PAIR_R_LIKELY = 0.65
 

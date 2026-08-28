@@ -9,6 +9,24 @@ Mode 1 (``match``)
 
 Mode 2 (``session``)
     The seed's session signature is compared against every indexed file's.
+
+Mode 3 (``pair``)
+    "Which other files captured this same stretch of time?"  Two pieces of
+    evidence, in order of generality:
+
+    1. **Activity envelope** (primary, equipment-independent).  The 1 Hz
+       loudness shape is a property of the performance, so it survives a
+       completely different microphone, preamp, gain and room position.  Best-
+       lag normalised cross-correlation finds the alignment.
+    2. **Constellation coherence** (confirming, shared-clock only).  Landmarks
+       that survive between the two captures should all agree on one offset --
+       or, if the two recorders' clocks differ, on one straight *line* through
+       (t_seed, t_lib).  Fitting that line's slope both sharpens the peak and
+       measures the clock drift in ppm.
+
+    Evidence 2 is decisive when it fires and silent when it does not: a second
+    recorder with different mics may share almost no landmarks at all.  So it
+    confirms, and the envelope leads.
 """
 
 from __future__ import annotations
@@ -20,8 +38,8 @@ from typing import Callable, Iterable, Optional
 
 import numpy as np
 
-from . import config
-from .analyze import analyze_seed
+from . import config, envelope as env
+from .analyze import analyze_seed, analyze_seed_full
 from .db import Database
 from .session import Signature, SessionScore, compare, pair_mate_role
 
@@ -102,12 +120,147 @@ class SessionHit:
 
 
 @dataclass
+class Coherence:
+    """Constellation agreement between the seed and one candidate, allowing
+    for a linear clock drift between the two recorders."""
+
+    votes: int = 0
+    background: int = 0
+    offset_frames: int = 0
+    drift_ppm: float = 0.0
+    slopes_tried: int = 1
+    #: True when the seed was long enough for the drift grid to hold more than
+    #: the zero slope.  When it is False, ``drift_ppm`` is 0 because drift was
+    #: not measurable, not because it was measured to be zero.
+    drift_measurable: bool = False
+    #: The grid step, in ppm, and therefore the smallest drift this seed length
+    #: could have seen.  ``drift_ppm == 0`` with a non-zero resolution means
+    #: "nothing above this was detected", not "the clocks agree exactly".
+    drift_resolution_ppm: float = 0.0
+
+    @property
+    def sharpness(self) -> float:
+        return self.votes / max(config.SHARPNESS_MIN_BACKGROUND,
+                                self.background)
+
+    @property
+    def offset_seconds(self) -> float:
+        return self.offset_frames * config.FRAME_SECONDS
+
+    @property
+    def level(self) -> str:
+        """``'strong'`` | ``'weak'`` | ``'none'``."""
+        if (self.votes >= config.PAIR_COHERENCE_STRONG_VOTES
+                and self.sharpness >= config.PAIR_COHERENCE_STRONG_SHARPNESS):
+            return "strong"
+        if (self.votes >= config.PAIR_COHERENCE_WEAK_VOTES
+                and self.sharpness >= config.PAIR_COHERENCE_WEAK_SHARPNESS):
+            return "weak"
+        return "none"
+
+
+@dataclass
+class PairHit:
+    file_id: int
+    path: str
+    duration: float
+    alignment: env.Alignment
+    coherence: Coherence = field(default_factory=Coherence)
+    segments: Optional[env.SegmentReport] = None
+    session: Optional[SessionScore] = None
+    take: Optional[int] = None
+    role: Optional[str] = None
+    is_take_mate: bool = False
+    is_seed_path: bool = False
+    missing: bool = False
+
+    @property
+    def verdict(self) -> str:
+        """``'PAIR'`` | ``'LIKELY PAIR'`` | ``'weak'``.
+
+        Two independent routes to PAIR, because two different rigs and one
+        rig produce different evidence:
+
+        * coherence is strong -- the two files share landmarks that all agree
+          on one line through (t_seed, t_lib), which essentially cannot happen
+          by chance -- *and* the envelope agrees it is the same timeline; or
+        * the envelope correlation alone is high enough that no measured
+          unrelated pair comes near it (see ``config.PAIR_R_STRONG``).
+
+        Everything above ``PAIR_R_LIKELY`` and below that is LIKELY PAIR, which
+        is the honest verdict for a genuine different-recorder capture: the
+        timeline matches, and there is no second piece of evidence available
+        because there could not be.
+        """
+        r = self.alignment.score
+        if not self.alignment.ok:
+            return "weak"
+        if self.coherence.level == "strong" and r >= config.PAIR_R_LIKELY:
+            return "PAIR"
+        if r >= config.PAIR_R_STRONG:
+            return "PAIR"
+        if r >= config.PAIR_R_LIKELY:
+            return "LIKELY PAIR"
+        return "weak"
+
+    @property
+    def evidence(self) -> list[str]:
+        """One line per piece of evidence actually behind this verdict."""
+        a = self.alignment
+        out: list[str] = []
+        if a.ok:
+            out.append(
+                f"envelope r={a.raw_r:+.2f} at lag {a.lag_seconds:+.0f}s "
+                f"(scored {a.score:+.2f} over a {a.overlap_seconds:.0f}s "
+                f"overlap)")
+        else:
+            out.append(f"no envelope alignment: {a.reason}")
+
+        c = self.coherence
+        if c.level == "none":
+            out.append(
+                "acoustic coherence: none -- consistent with a capture on "
+                "different equipment (or with no shared audio at all)")
+        else:
+            if not c.drift_measurable:
+                drift = ", clock drift not measurable on a seed this short"
+            elif c.drift_ppm:
+                drift = (f", clock drift {c.drift_ppm:+.0f} ppm "
+                         f"(+/-{c.drift_resolution_ppm:.0f})")
+            else:
+                drift = (f", no clock drift above the "
+                         f"{c.drift_resolution_ppm:.0f} ppm this seed length "
+                         f"can resolve")
+            out.append(
+                f"acoustic coherence: {c.level} ({c.votes} aligned landmark "
+                f"votes, {c.sharpness:.1f}x sharpness, offset "
+                f"{c.offset_seconds:+.2f}s{drift})")
+
+        if self.is_take_mate:
+            out.append(f"filename: dual-record pair-mate of the seed "
+                       f"(take {self.take:04d} {self.role})")
+        elif self.take is not None:
+            out.append(f"filename: Tascam take {self.take:04d}"
+                       f"{' ' + self.role if self.role else ''}")
+        if self.session is not None:
+            out.append(f"session signature: {self.session.total:.2f} "
+                       f"(mode 2's score, as supporting evidence only)")
+        if self.segments is not None:
+            out.append(self.segments.text)
+        if self.is_seed_path:
+            out.append("this is the seed file itself")
+        return out
+
+
+@dataclass
 class QueryResult:
     seed_path: str
     seed_seconds: float
     seed_signature: Optional[Signature] = None
     matches: list[MatchHit] = field(default_factory=list)
     sessions: list[SessionHit] = field(default_factory=list)
+    pairs: list[PairHit] = field(default_factory=list)
+    pair_note: str = ""
     probes_run: list[str] = field(default_factory=list)
     seed_hash_counts: dict[str, int] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
@@ -344,6 +497,237 @@ def session_search(db: Database, seed_sig: Signature, *, top: int = 10,
 
 
 # --------------------------------------------------------------------------
+# Mode 3
+# --------------------------------------------------------------------------
+
+
+def drift_slopes(seed_frames: int) -> np.ndarray:
+    """Clock-drift slopes (ppm) worth trying for a seed of this length.
+
+    Two slopes are only distinguishable when they move votes by more than one
+    *smoothed* histogram bin (``2 * OFFSET_SMOOTH + 1`` frames) across the
+    whole seed, so the grid step is the larger of ``PAIR_DRIFT_MIN_STEP_PPM``
+    and that.  When the step is so coarse that fewer than two of them fit
+    inside ``PAIR_MAX_DRIFT_PPM``, no drift is fitted at all and the caller
+    reports "not measurable": announcing "-300 ppm" off a 150-second seed
+    would be invention.  A 45-minute seed gets the full +/-300 ppm grid.
+
+    Ordered by increasing magnitude, so ties resolve toward "no drift" -- the
+    more conservative claim.
+    """
+    return drift_grid(seed_frames)[0]
+
+
+def drift_grid(seed_frames: int) -> tuple[np.ndarray, float]:
+    """``(slopes_ppm, step_ppm)``.  ``step_ppm`` is 0 when no fit is possible.
+
+    The step is also the honest resolution to quote alongside any estimate:
+    a drift smaller than one step is, at this seed length, not a thing this
+    tool can see.
+    """
+    if seed_frames <= 0:
+        return np.zeros(1, dtype=np.float64), 0.0
+    bin_frames = float(2 * config.OFFSET_SMOOTH + 1)
+    ppm_per_bin = 1e6 * bin_frames / float(seed_frames)
+    step = max(config.PAIR_DRIFT_MIN_STEP_PPM, ppm_per_bin)
+    n = int(config.PAIR_MAX_DRIFT_PPM // step)
+    n = min(n, (config.PAIR_MAX_DRIFT_SLOPES - 1) // 2)
+    if n < 2:
+        return np.zeros(1, dtype=np.float64), 0.0
+    mags = np.arange(1, n + 1, dtype=np.float64) * step
+    slopes = np.concatenate([[0.0],
+                             np.stack([mags, -mags], axis=1).ravel()])
+    return slopes, step
+
+
+def fit_coherence(seed_t: np.ndarray, deltas: np.ndarray, *,
+                  seed_frames: int, center_frames: int) -> Coherence:
+    """Sharpen the offset histogram by fitting a clock-drift slope.
+
+    A single recorder's landmarks all land in one offset bin.  Two recorders
+    whose sample clocks differ by ``s`` ppm put theirs on the *line*
+    ``t_lib = (1 + s) * t_seed + offset``, which smears that bin across
+    ``s * duration`` frames.  Compensating the seed timestamps by each
+    candidate slope and keeping the sharpest histogram both recovers the votes
+    and measures ``s``.
+
+    Only the window ``+/- PAIR_COHERENCE_WINDOW_SECONDS`` around the lag the
+    envelope proposed is examined: this is *confirmation* of that specific
+    alignment, not an independent search, and bounding the window is what keeps
+    a 45-minute seed's drift fit cheap.  The sharpness denominator is therefore
+    the tallest competing bin inside the window, which is a stricter reference
+    than mode 1's whole-file background, not a looser one.
+
+    A non-zero slope is only *believed* if it beats the zero slope by
+    ``PAIR_DRIFT_MIN_GAIN``.  Compensating for a drift that was never there
+    still wins the occasional vote by luck, and without that bar the fit
+    cheerfully reported "+77 ppm" for two files recorded off the same crystal.
+    """
+    half = int(round(config.PAIR_COHERENCE_WINDOW_SECONDS
+                     / config.FRAME_SECONDS))
+    width = 2 * half + 1
+    slopes, step = drift_grid(seed_frames)
+    guard = 2 * config.OFFSET_SMOOTH + 1
+    kernel = np.ones(guard, dtype=np.int64)
+    blank = Coherence(slopes_tried=int(slopes.size),
+                      drift_measurable=bool(slopes.size > 1),
+                      drift_resolution_ppm=step)
+    if deltas.size == 0:
+        return blank
+
+    seed_f = seed_t.astype(np.float64)
+    best = blank
+    zero_votes = 0
+    # ``slopes`` is ordered by magnitude with 0.0 first, so the zero slope's
+    # vote count is known before any other slope is judged against it.
+    for ppm in slopes:
+        shifted = deltas - (ppm * 1e-6) * seed_f
+        d = np.rint(shifted).astype(np.int64) - center_frames
+        sel = (d >= -half) & (d <= half)
+        if not sel.any():
+            continue
+        counts = np.bincount(d[sel] + half, minlength=width)
+        smoothed = (counts if config.OFFSET_SMOOTH <= 0
+                    else np.convolve(counts, kernel, mode="same"))
+        peak = int(np.argmax(smoothed))
+        votes = int(smoothed[peak])
+        if ppm == 0.0:
+            zero_votes = votes
+        elif votes < zero_votes * config.PAIR_DRIFT_MIN_GAIN:
+            continue                  # not enough gain to be a measurement
+        if votes <= best.votes:
+            continue                  # ties keep the smaller |ppm|
+        lo, hi = max(0, peak - guard), min(width, peak + guard + 1)
+        away = np.concatenate([smoothed[:lo], smoothed[hi:]])
+        best = Coherence(
+            votes=votes,
+            background=int(away.max()) if away.size else 0,
+            offset_frames=peak - half + center_frames,
+            drift_ppm=float(ppm),
+            slopes_tried=int(slopes.size),
+            drift_measurable=bool(slopes.size > 1),
+            drift_resolution_ppm=step)
+    return best
+
+
+def pair_search(db: Database, seed_path: str, *, top: int = 10,
+                ignore_filenames: bool = False,
+                warn: Optional[Callable[[str], None]] = None,
+                ) -> tuple[list[PairHit], float, Optional[Signature], str]:
+    """Find files that captured the same session timeline as ``seed_path``.
+
+    Returns ``(hits, seed_seconds, seed_signature, note)``; ``note`` is a
+    human-readable explanation when the mode could not run at all.
+    """
+    warn = warn or (lambda msg: None)
+    seed = analyze_seed_full(seed_path)
+    seed_codes = seed.envelope
+    seed_db = env.dequantize(seed_codes)
+
+    missing = db.count_missing_envelopes()
+    if missing:
+        warn(f"{missing:,} indexed file(s) have no activity envelope and are "
+             f"invisible to pair mode -- run 'audio-match backfill' once to "
+             f"fill them in (no re-fingerprinting, no re-index)")
+
+    if seed_codes.size < env.samples(config.PAIR_MIN_ENVELOPE_SECONDS):
+        note = (f"seed is {seed.seconds:.0f}s long; pair mode needs at least "
+                f"{config.PAIR_MIN_ENVELOPE_SECONDS:.0f}s of audio, because "
+                f"below that the 1 Hz envelope has too few points for a "
+                f"correlation to mean anything")
+        return [], seed.seconds, seed.signature, note
+
+    rows = list(db.iter_envelopes())
+    if not rows:
+        note = ("no indexed file has an activity envelope; run "
+                "'audio-match backfill' (or re-index) before using pair mode")
+        return [], seed.seconds, seed.signature, note
+
+    cand_db = [env.dequantize(r.envelope) for r in rows]
+    alignments = env.align_many(seed_db, cand_db)
+    order = sorted(range(len(rows)),
+                   key=lambda i: (-alignments[i].score, rows[i].path))
+
+    n_report = max(top, config.PAIR_COHERENCE_CANDIDATES)
+    chosen = [i for i in order[:n_report] if alignments[i].ok]
+    if not chosen:
+        reasons = {a.reason for a in alignments if a.reason}
+        note = ("no indexed file overlaps the seed enough to be compared"
+                + (f" ({sorted(reasons)[0]})" if reasons else ""))
+        return [], seed.seconds, seed.signature, note
+
+    # -- evidence 2: constellation coherence, for the top candidates only.
+    #
+    # The posting lookup restricts *results* to the candidate ids but still
+    # applies MAX_POSTINGS_PER_HASH across the whole library, exactly as mode 1
+    # does.  That is deliberate: a hash that occurs in thousands of files is
+    # hum or hiss, and it says nothing about these two files just because only
+    # two of them are being looked at right now.
+    coherence: dict[int, Coherence] = {}
+    ids = {rows[i].id for i in chosen[:config.PAIR_COHERENCE_CANDIDATES]}
+    seed_frames = int(round(seed.seconds * config.FRAME_RATE))
+    if seed.hashes.size and ids:
+        h, t = seed.hashes, seed.times
+        if h.size > MAX_SEED_HASHES:
+            step = int(math.ceil(h.size / MAX_SEED_HASHES))
+            warn(f"seed produced {h.size:,} landmarks, above the "
+                 f"{MAX_SEED_HASHES:,} cap: keeping every {step}th for the "
+                 f"coherence check.")
+            h, t = h[::step], t[::step]
+        file_ids, deltas, seed_t = _search_hashes(db, h, t, ids)
+        if file_ids.size:
+            p_order = np.argsort(file_ids, kind="stable")
+            p_files = file_ids[p_order]
+            p_deltas = deltas[p_order]
+            p_seed_t = seed_t[p_order]
+            lag_frames = {rows[i].id: int(round(alignments[i].lag_seconds
+                                                / config.FRAME_SECONDS))
+                          for i in chosen}
+            for fid in ids:
+                lo = int(np.searchsorted(p_files, fid, side="left"))
+                hi = int(np.searchsorted(p_files, fid, side="right"))
+                if hi <= lo:
+                    continue
+                coherence[fid] = fit_coherence(
+                    p_seed_t[lo:hi], p_deltas[lo:hi],
+                    seed_frames=seed_frames,
+                    center_frames=lag_frames.get(fid, 0))
+
+    # -- supporting evidence, for every candidate that reached this far.
+    seed_path_abs = os.path.abspath(seed_path)
+    mate_role = (pair_mate_role(seed.signature.role)
+                 if not ignore_filenames else None)
+    hits: list[PairHit] = []
+    for i in chosen:
+        row = rows[i]
+        a = alignments[i]
+        meta = db.file_row(row.id)
+        session = (compare(seed.signature, meta.signature(),
+                           ignore_filenames=ignore_filenames)
+                   if meta is not None else None)
+        hits.append(PairHit(
+            file_id=row.id, path=row.path, duration=row.duration,
+            alignment=a, coherence=coherence.get(row.id, Coherence()),
+            segments=env.compare_segments(seed_db, cand_db[i], a.lag),
+            session=session, take=row.take, role=row.role,
+            is_take_mate=bool(
+                not ignore_filenames and seed.signature.take is not None
+                and row.take == seed.signature.take
+                and mate_role and row.role == mate_role),
+            is_seed_path=os.path.abspath(row.path) == seed_path_abs,
+            missing=not os.path.exists(row.path)))
+
+    # Candidates were *generated* by envelope score alone, but they are
+    # *reported* verdict-first.  A file whose landmarks line up on a drifting
+    # line with the seed is as close to proof as this tool gets, and burying
+    # it under a slightly higher envelope score with no second evidence behind
+    # it would be the wrong way round.
+    rank = {"PAIR": 0, "LIKELY PAIR": 1, "weak": 2}
+    hits.sort(key=lambda h: (rank[h.verdict], -h.alignment.score, h.path))
+    return hits[:top], seed.seconds, seed.signature, ""
+
+
+# --------------------------------------------------------------------------
 # Combined
 # --------------------------------------------------------------------------
 
@@ -351,7 +735,13 @@ def session_search(db: Database, seed_sig: Signature, *, top: int = 10,
 def run_query(db: Database, seed_path: str, *, mode: str = "both",
               top: int = 10, try_rates: bool = False,
               ignore_filenames: bool = False) -> QueryResult:
-    """Run one or both query modes.
+    """Run the requested query mode(s).
+
+    ``mode='both'`` deliberately means *match + session* and nothing else.
+    Pair matching is a separate, explicitly requested mode: it is a different
+    question ("what else recorded this hour?") with a different answer shape,
+    and quietly bolting it onto the default would have changed the output of
+    every existing invocation.
 
     ``try_rates`` (the ``--try-rates`` flag) additionally re-decodes the seed
     at the 44.1/48 kHz ratios.  It is **off by default**: it triples the seed
@@ -359,6 +749,16 @@ def run_query(db: Database, seed_path: str, *, mode: str = "both",
     """
     result = QueryResult(seed_path=seed_path, seed_seconds=0.0)
     probes = config.SR_PROBES if try_rates else (config.SR_PROBES[0],)
+
+    if mode == "pair":
+        hits, secs, sig, note = pair_search(
+            db, seed_path, top=top, ignore_filenames=ignore_filenames,
+            warn=result.warnings.append)
+        result.pairs = hits
+        result.seed_seconds = secs
+        result.seed_signature = sig
+        result.pair_note = note
+        return result
 
     if mode in ("match", "both"):
         hits, secs, counts, sig = match_search(

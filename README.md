@@ -1,6 +1,6 @@
 # audio-match
 
-Find, in a very large library of audio files, both:
+Find, in a very large library of audio files:
 
 1. **The same audio** — other transfers, mixes, excerpts or lossy encodes of
    the same performance, even at a different gain, sample rate or bitrate.
@@ -8,9 +8,14 @@ Find, in a very large library of audio files, both:
    room, on the same day. Different music, so content matching cannot find
    them; this mode works from the noise floor, the mains hum, the converter's
    DC bias and the channel behaviour instead.
+3. **Pair mates** — other files that captured *the same stretch of time*,
+   including captures made on entirely different equipment: another recorder,
+   other microphones, an unsynchronised clock and a different start time. This
+   mode works from the loudness envelope of the performance, which every
+   microphone in the room heard the same way.
 
 Built for a ~1.45 TB library of Tascam DR-40 WAVs on a Linux server. One
-indexing pass, one SQLite file, two query modes.
+indexing pass, one SQLite file, three query modes.
 
 ---
 
@@ -42,6 +47,9 @@ audio-match index /mnt/library
 
 # Who else has this performance?  And what else came from this session?
 audio-match query ~/seed.wav
+
+# What else was recording while this was recorded?
+audio-match query ~/seed.wav --mode pair
 ```
 
 The database defaults to **`~/.audio-match.db`**. Override it with a global
@@ -57,7 +65,8 @@ audio-match --db /var/lib/audio-match.db query ~/seed.wav --mode match --top 20
 | Command | What it does |
 | --- | --- |
 | `index <dir>` | Scan and fingerprint a library. Resumable; prunes files that have vanished from the root. |
-| `query <file>` | Search with a seed file. `--mode match\|session\|both` (default `both`). |
+| `query <file>` | Search with a seed file. `--mode match\|session\|both\|pair` (default `both`). |
+| `backfill` | Compute the activity envelope for files indexed before mode 3 existed. Needed **once** per pre-existing database; decodes only those files and rewrites no fingerprints. |
 | `stats` | Index size, hours of audio, landmark count, bytes per hour. |
 | `errors` | List every file that failed to decode, with the reason. |
 | `purge` | Reclaim space left by re-indexed (superseded) files. |
@@ -73,7 +82,9 @@ Useful flags:
 * `query --top N` — how many results per mode (default 10).
 * `query --try-rates` — also try the 44.1/48 kHz mislabel probes (3x slower,
   **off by default**; see [Sample-rate mislabelling](#sample-rate-mislabelling)).
-* `query --ignore-filenames` — score mode 2 on audio evidence only.
+* `query --ignore-filenames` — score modes 2 and 3 on audio evidence only,
+  ignoring Tascam take numbers parsed from filenames.
+* `backfill --workers N` — worker processes for the envelope pass.
 
 ---
 
@@ -308,6 +319,286 @@ something true and leaving the judgement to you.
 
 ---
 
+## Mode 3 — pair mates (same session timeline)
+
+> **New databases get this automatically. An index built before mode 3 existed
+> needs one `audio-match backfill` pass first — not a re-index.** See
+> [Backfilling an older index](#backfilling-an-older-index).
+
+Modes 1 and 2 answer "is this the same audio?" and "is this the same rig?".
+Mode 3 answers a third question: **which other files captured this same stretch
+of time?**
+
+That covers two quite different situations, and the difference matters:
+
+* **Dual-record.** The DR-40 in 4-channel mode writes `…S12.wav` and
+  `…S34.wav` for one take: the same performance through two different
+  microphone pairs, on one recorder, on one clock.
+* **A multi-recorder rig.** Extra channels captured on entirely separate
+  equipment — different microphones, different gain, a different position in
+  the room, a sample clock that agrees with nobody, and a start time that is
+  whenever somebody pressed record.
+
+The first case is easy for mode 1. The second is impossible for it: change the
+microphone and its position and almost every spectral peak moves, so almost
+every landmark differs. Mode 3 leads with evidence that does not care what the
+equipment was.
+
+### Evidence 1 — the activity envelope (primary)
+
+Every file carries a **loudness envelope at one value per second**: the RMS of
+the mono downmix over each second, in dBFS. Two files are compared by
+best-lag normalised cross-correlation of those envelopes.
+
+This works across rigs because the envelope is a property of *the performance*,
+not of the capture. Songs start and stop, applause happens, somebody talks
+between numbers — and every microphone in the room hears that same shape,
+however differently it hears the timbre. EQ, reverb, 6 dB less gain and a
+128 kbps mp3 leave it essentially untouched.
+
+**Why one value per second, specifically.** Two recorders have independent
+crystals. Tens of ppm of disagreement is normal; 200 ppm would be a bad pair of
+consumer machines. Over a 45-minute take, 200 ppm is
+`200e-6 × 2700 s = 0.54 s` — *half an envelope sample*. So at 1 Hz an
+unsynchronised second recorder still produces a single sharp correlation peak
+and no drift model is needed at all. At 10 Hz the same drift would smear that
+peak across five samples and the score would collapse. 1 Hz is the resolution
+at which clock drift stops mattering.
+
+It is also free: one byte per second is 2.6 KB for a 45-minute file, about 9 MB
+for a 2500-hour library, and it is accumulated during the single decode pass
+that already feeds modes 1 and 2.
+
+**The overlap penalty, and why it is the whole ballgame.** Correlating two
+envelopes at their best lag, naively, does not work. Measured over the whole
+recovered corpus (8 files, 56 ordered pairs -- 8 true, 48 unrelated):
+
+| statistic | true S12/S34 pairs | unrelated pairs |
+| --- | --- | --- |
+| raw best-lag Pearson r | 0.913 … 0.948 | up to **0.911** |
+| penalised score | 0.887 … 0.937 | up to **0.584** |
+
+The raw correlation does not separate at all, and the reason is completely
+predictable once you see it: every recording starts quiet, gets loud and ends
+quiet. Slide two unrelated files until only their *edges* touch and you are
+correlating two fades. The worst real instance: `pakDR40_S34` against
+`TASCAM_0077S34`, two entirely unrelated sessions, raw r = 0.878 over 307
+seconds of overlap out of the 2437 available.
+
+So the reported score penalises an overlap for being thin in both senses:
+
+```
+score = r × (L / L_max)^0.5 × sqrt(L / (L + 60 s))
+```
+
+where `L` is the overlap at the winning lag and `L_max = min(len(seed),
+len(candidate))`. The **relative** term is what kills the edge artefact, and it
+costs a true pair nothing — a true pair's best lag is the one that uses all the
+overlap there is, so its factor is 1. The **absolute** term guards the opposite
+end, where a short seed overlaps a long library file fully at hundreds of
+different lags and the relative term cannot help; one minute of overlap scores
+at 0.71 of face value, five minutes at 0.91, forty-five at 0.99.
+
+On top of that, lags overlapping by less than
+`max(60 s, min(5 min, 50% of the shorter file))` are not considered at all.
+
+The output reports both numbers — `envelope r=+0.89 … (scored +0.81 over a
+300s overlap)` — so you can always see what the penalty did.
+
+### Evidence 2 — constellation coherence (confirming)
+
+For the top envelope candidates, mode 3 also runs the mode-1 landmark search,
+restricted to those files. Landmarks that survive between two captures should
+all agree on one time offset — or, if the two recorders' clocks differ, on one
+straight **line** through `(t_seed, t_library)`. Fitting that line's slope both
+recovers votes that a plain offset histogram would have smeared away and
+measures the clock drift in ppm.
+
+**Drift is much harder to measure than it looks, and the tool says so.** Two
+slopes are distinguishable only when they move votes by more than a smoothed
+histogram bin (3 frames, 70 ms) across the whole seed:
+
+| seed length | grid step | slopes tried | total drift at 100 ppm |
+| --- | ---: | ---: | --- |
+| 150 s | — | 1 (zero) | 6.5 ms — 0.3 bins, **no fit attempted** |
+| 10 min | 116 ppm | 5 | 65 ms — 0.9 bins |
+| 45 min | 26 ppm | 23 | 270 ms — 3.9 bins |
+
+The last column is what actually matters. Measured on the corpus: a genuine
++104 ppm on a *ten-minute* seed recovers only **4% more votes** when
+compensated — 3189 at zero drift against 3322 at the nearest grid point. That
+is a coin flip, not a measurement, and an earlier version of this fit duly
+reported a confident `+77 ppm` for it — and reported `+77 ppm` just as
+confidently for two files recorded off *the same crystal*.
+
+So a non-zero slope has to beat the zero slope by 10% of its votes before it is
+believed. Below that the output says **"no clock drift above the 116 ppm this
+seed length can resolve"**, which is a different statement from "the clocks
+agree"; and a seed too short for any grid says *drift not measurable*. In
+practice the drift figure earns its keep on full-length seeds — which is the
+normal way to use this mode — and is honestly silent on excerpts.
+
+Coherence is evaluated only within ±30 s of the lag the envelope proposed: it
+is confirmation of that specific alignment, not an independent search. That
+also means its sharpness figure is measured against the tallest competing bin
+*inside that window*, which is a stricter reference than mode 1's whole-file
+background, not a looser one.
+
+**Coherence is decisive when it fires and silent when it does not.** A second
+recorder with different microphones may share no usable landmarks at all. So:
+
+> **`acoustic coherence: none` is not evidence against a pair.** It is the
+> expected reading for a genuine different-equipment capture.
+
+### The verdict
+
+| Verdict | Requires |
+| --- | --- |
+| **PAIR** | score ≥ 0.80, **or** coherence `strong` with score ≥ 0.65 |
+| **LIKELY PAIR** | score ≥ 0.65 |
+| weak | anything below |
+
+Two routes to PAIR, because one rig and two rigs leave different evidence.
+Coherence `strong` (≥ 30 aligned votes at ≥ 4× sharpness) essentially cannot
+happen by chance, so it promotes a merely-plausible envelope score; but it can
+never rescue an envelope that disagrees about the timeline.
+
+Candidates are *generated* by envelope score alone — everything is correlated,
+the top 20 get the coherence pass — but they are *reported* verdict first, then
+by score. A file whose landmarks fall on a drifting line with the seed is as
+close to proof as this tool gets, and burying it under a slightly higher
+envelope score with nothing behind it would be the wrong way round.
+
+The thresholds come from the measurements above. The unrelated set is the
+*hardest* negative class available — the same band, the same recorder, the same
+room, sets of similar length and shape on different days — so its 0.584 ceiling
+is realistic rather than flattering. LIKELY PAIR at 0.65 clears it; PAIR at
+0.80 sits in the empty middle of a gap 0.30 wide.
+
+**LIKELY PAIR is the honest verdict for a different-recorder capture**, and is
+not a lesser result. The test suite's simulated second rig (+104 ppm resample,
+−6 dB below 200 Hz, +3 dB above 4 kHz, an echo, −6 dB gain, 128 kbps mp3)
+scores **0.871** on the envelope (raw r 0.913) at exactly the right lag, with
+the runner-up at 0.407.
+
+### What the output says
+
+Every hit lists the evidence actually behind it, one line each. This is a real
+run, seeded with `TASCAM_0077S34` against a library holding the four sessions'
+`S12` files (lines wrapped here for width):
+
+```
+== MODE 3: pair mates (same session timeline) ==
+seed: .../seeds/TASCAM_0077S34.wav
+seed length: 10:00.0
+seed filename parsed as Tascam take 0077 S34
+
+ 1. [   PAIR    ] .../lib/TASCAM_0077S12.wav
+      length 10:00.0; the seed's 0:00 lands at 0:00.0 in this file
+      - envelope r=+0.93 at lag +0s (scored +0.88 over a 600s overlap)
+      - acoustic coherence: strong (289 aligned landmark votes, 26.3x
+        sharpness, offset +0.00s, no clock drift above the 116 ppm this
+        seed length can resolve)
+      - filename: dual-record pair-mate of the seed (take 0077 S12)
+      - session signature: 0.81 (mode 2's score, as supporting evidence only)
+      - segments align: 8/8 boundaries within +/-4s (4 active stretch(es) in
+        the seed, 4 in this file)
+
+ 2. [   weak    ] .../lib/pakDR40_S12.wav
+      length 10:00.0; the seed's 0:00 lands at -3:23.0 in this file
+      - envelope r=+0.55 at lag -203s (scored +0.42 over a 397s overlap)
+      - acoustic coherence: none -- consistent with a capture on different
+        equipment (or with no shared audio at all)
+      - session signature: 0.49 (mode 2's score, as supporting evidence only)
+      - segments align: 2/5 boundaries within +/-4s (4 active stretch(es) in
+        the seed, 4 in this file)
+```
+
+Note what the runner-up shows: a respectable-looking raw `r=+0.55`, found at a
+lag that only overlaps by 397 of the available 600 seconds, penalised to 0.42 —
+and 2 of 5 track boundaries lining up, which is what "no relationship" looks
+like next to the winner's 8 of 8.
+
+Take numbers and the mode-2 session score appear as **supporting evidence
+lines, never as gates** — `pakDR40_S12.wav` has no parseable take number at all
+and still wins its own query on the audio.
+
+### The segment view
+
+The last line is for reading in terms of tracks rather than correlations. The
+aligned envelopes are smoothed over 5 s and thresholded 35% of the way from the
+10th to the 90th percentile of each file's own levels; runs under 20 s and gaps
+under 8 s are absorbed so that a bar of rest inside a tune does not read as two
+tracks. The surviving boundaries are then matched across the alignment.
+
+`segments align: 6/6 boundaries within ±4s` means the two files agree about
+where six track starts and ends fall. **This is presentation only and does not
+affect the verdict** — it is a sanity check you can hear, and a way to talk
+about the result with somebody who thinks in set lists.
+
+### Backfilling an older index
+
+The envelope lives in a new `files.envelope` column. This is a *storage*
+change, not a fingerprint change, so an existing database is **not** invalidated
+and does **not** need re-indexing — its landmarks and session signatures are
+still exactly right. Opening it migrates the table in place; one pass then
+fills the new column:
+
+```bash
+audio-match backfill                     # or --db PATH, --workers N
+```
+
+Backfill decodes only the rows whose envelope is missing, and computes only the
+envelope — no STFT, no peak picking, no hashing — which makes it roughly three
+times cheaper per byte than indexing. It writes one column with a targeted
+`UPDATE`: landmarks, signatures, sizes and mtimes come out byte-identical.
+Like `index`, it is resumable — the work list is "rows with no envelope", which
+shrinks as the run commits — and a file whose size or mtime no longer matches
+its row is skipped rather than filled, because an envelope computed from audio
+the landmarks were *not* computed from would be worse than none. Run
+`audio-match index` on those.
+
+Files indexed after this change always get an envelope; `stats`, `index` and
+`query --mode pair` all tell you if any are still missing.
+
+### Limitations of mode 3
+
+* **Anything that recorded the same hour will match.** The soundboard feed, the
+  house recording, another band's punter with a phone in his pocket — if it
+  captured the same timeline, its envelope correlates and it is a true positive
+  by mode 3's definition. That is usually exactly what you want. When it is
+  not, the coherence line and the take number are what single out one
+  recorder's own dual-record mate.
+* **Mode 3 does not need, and does not check, that the audio is the same.**
+  Envelope agreement means "these were recording at the same time", nothing
+  more. Use mode 1 when you need "this is the same audio".
+* **Below a minute of seed it refuses.** At 1 Hz, a 30-second seed is 30
+  numbers; correlated against a few hundred candidate lags, r > 0.8 happens by
+  chance routinely. Pair mode says so rather than reporting a number it does
+  not believe. Ten minutes or more is comfortable.
+* **Silence has no shape.** A file of room tone has a flat envelope and cannot
+  be aligned to anything; mode 3 reports that rather than correlating noise.
+* **Drift beyond ±300 ppm is not searched**, and drift is not measurable at all
+  on short seeds (see the table above). The envelope alignment itself is
+  unaffected either way — that is the point of 1 Hz.
+* **A performance with no dynamics is hard.** The envelope carries information
+  only where the loudness *changes*; a continuous, evenly-loud 45 minutes gives
+  the correlation little to hold on to. Sets with gaps between numbers are the
+  easy case, and are also the normal one.
+* **The thresholds are calibrated on four sessions, not four hundred.** The
+  gap between true pairs and unrelated ones is wide (0.887 … 0.937 against
+  0.402 … 0.584 on whole files), but the *closest* negative measured — two
+  different sessions by the same band, compared over ten-minute excerpts —
+  reached 0.620 against a LIKELY PAIR bar of 0.65. That 0.03 is the thinnest
+  margin anywhere in this mode, and it is on excerpts rather than whole files.
+  Seed with as much of the recording as you have; the separation improves with
+  length, and it is what the numbers above were measured on.
+* **`--mode both` is deliberately still match + session.** Pair matching is a
+  different question with a different answer shape, so it is requested
+  explicitly with `--mode pair` rather than bolted onto the default output.
+
+---
+
 ## Indexing 1.45 TB
 
 **One pass, and the disk is the bottleneck.** Each file is read exactly once;
@@ -452,10 +743,18 @@ to one line every 50 files instead of a redrawing status line.
   sensitivity for very short excerpts, raise
   `INDEX_PEAKS_PER_BAND_PER_SEC` in `audiomatch/config.py` and re-index —
   database size scales with it roughly linearly.
+* **Mode 3 finds co-recordings, not the same audio.** Envelope agreement means
+  "these two files were recording at the same time" — a soundboard feed, the
+  house recording or somebody else's machine all qualify, correctly. See
+  [Limitations of mode 3](#limitations-of-mode-3) for the rest.
+* **Mode 3 needs an envelope, and old databases do not have one.** Run
+  `audio-match backfill` once. `stats`, `index` and `query --mode pair` all say
+  so if any files are still missing it.
 * **Changing anything in `config.py` marked `FINGERPRINT_AFFECTING` invalidates
   the database.** Bump `SCHEMA_VERSION` when you do; existing databases will
   then refuse to open with a message telling you to re-index, rather than
-  silently returning garbage.
+  silently returning garbage. Adding a *column* is different — bump
+  `STORAGE_VERSION`, add a migration, and leave the fingerprints alone.
 
 ---
 
@@ -467,10 +766,11 @@ to one line every 50 files instead of a redrawing status line.
 | `audiomatch/audio.py` | ffmpeg/ffprobe subprocess decoding, streaming and one-shot. |
 | `audiomatch/fingerprint.py` | Streaming STFT, peak picking, landmark hashing. |
 | `audiomatch/session.py` | Noise floor, hum, channel stats, filename parsing, similarity. |
-| `audiomatch/analyze.py` | One decode per file, feeding both fingerprints. |
+| `audiomatch/envelope.py` | 1 Hz activity envelope: quantisation, streaming, FFT alignment, segments. |
+| `audiomatch/analyze.py` | One decode per file, feeding all three signatures. |
 | `audiomatch/db.py` | SQLite schema, writes, lookups, purge. |
-| `audiomatch/indexer.py` | Directory walk, resume planning, worker pool, progress. |
-| `audiomatch/query.py` | Offset histograms, scoring, session ranking. |
+| `audiomatch/indexer.py` | Directory walk, resume planning, worker pool, progress, backfill. |
+| `audiomatch/query.py` | Offset histograms, scoring, session ranking, drift fitting, pair verdicts. |
 | `audiomatch/cli.py` | Argument parsing and all human-readable output. |
 
 ### Schema
@@ -483,6 +783,8 @@ CREATE TABLE files (
     bits INTEGER, codec TEXT, take INTEGER, role TEXT,
     n_hashes INTEGER,
     noise BLOB, hum BLOB, chan BLOB,     -- float32 session signature
+    envelope BLOB,                       -- uint8 dBFS/second activity envelope
+                                         -- NULL = never computed -> 'backfill'
     indexed_at REAL
 );
 CREATE UNIQUE INDEX ix_files_path ON files(path) WHERE alive = 1;
@@ -493,16 +795,31 @@ CREATE TABLE hashes (
 ) WITHOUT ROWID;
 ```
 
+Two version numbers live in `meta`, and they mean different things:
+
+| Key | Meaning | On mismatch |
+| --- | --- | --- |
+| `schema_version` | The stored **fingerprints** changed. | Refuse to open: delete and re-index. |
+| `storage_version` | The **table layout** grew something the existing fingerprints are still valid under. | Migrate in place (additive `ALTER TABLE`), then `audio-match backfill` fills the new column. |
+
+Splitting them is the reason adding mode 3 did not invalidate anybody's index.
+A `storage_version` *newer* than the running build is refused, since this build
+cannot know what the columns it does not have are supposed to contain.
+
 ---
 
 ## Tests
 
 ```bash
 pip install pytest
-python3 -m pytest tests/          # ~2 minutes
+python3 -m pytest tests/          # ~5 minutes once the excerpt cache is warm
 ```
 
 The suite runs against the **real** recovered DR-40 corpus in
 `/mnt/host/projects/audio-recovery/recovered/`, cutting short excerpts with
 ffmpeg into a scratch directory (it never loads a whole 1 GB file). If that
 corpus is not present those tests skip and the pure unit tests still run.
+
+The first run is much slower than later ones: it cuts every excerpt it needs
+(including four ten-minute pairs for mode 3, ~1.4 GB) and caches them. Point
+`AUDIOMATCH_TEST_DIR` somewhere with a couple of gigabytes free.

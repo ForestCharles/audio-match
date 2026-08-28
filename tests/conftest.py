@@ -125,3 +125,66 @@ def indexed_db(corpus: Corpus, tmp_path_factory) -> str:
     assert summary["errors"] == 0
     assert summary["indexed"] == 8
     return db_path
+
+
+# --------------------------------------------------------------------------
+# Pair mode needs a second, longer library
+# --------------------------------------------------------------------------
+
+#: Pair mode correlates a *1 Hz* envelope, so its excerpts are measured in
+#: minutes, not the 150 s that is plenty for the constellation.  Ten minutes
+#: is the shortest length at which all four sessions' true pairs clear the
+#: PAIR threshold on the envelope alone (measured: 0.820, 0.883, 0.896, 0.921
+#: at 600 s; 0.698 .. 0.886 at 300 s, where two of the four fall back on
+#: coherence for their verdict).
+PAIR_EXCERPT_SECONDS = 600.0
+
+
+@dataclass
+class PairCorpus:
+    """A library holding **one** member of each dual-record pair.
+
+    The seeds are the other member, cut from the same wall-clock range.  If
+    both members were in the library, a seed would always rank its own
+    recording first and "does the mate come top?" could not be asked.
+    """
+
+    lib: str
+    seeds: str
+
+    def lib_file(self, session: str) -> str:
+        return os.path.join(self.lib, SESSIONS[session][0])       # the S12
+
+    def seed_file(self, session: str) -> str:
+        return os.path.join(self.seeds, SESSIONS[session][1])     # the S34
+
+
+@pytest.fixture(scope="session")
+def pair_corpus() -> PairCorpus:
+    if not (have_ffmpeg() and have_corpus()):
+        pytest.skip("corpus unavailable")
+    root = os.path.join(SCRATCH, "pair")
+    c = PairCorpus(lib=os.path.join(root, "lib"),
+                   seeds=os.path.join(root, "seeds"))
+    os.makedirs(c.lib, exist_ok=True)
+    os.makedirs(c.seeds, exist_ok=True)
+    for session, (s12, s34, start) in SESSIONS.items():
+        cut(os.path.join(RECOVERED, s12), c.lib_file(session),
+            start, PAIR_EXCERPT_SECONDS)
+        cut(os.path.join(RECOVERED, s34), c.seed_file(session),
+            start, PAIR_EXCERPT_SECONDS)
+    return c
+
+
+@pytest.fixture(scope="session")
+def pair_db(pair_corpus: PairCorpus, tmp_path_factory) -> str:
+    from audiomatch.db import open_db
+    from audiomatch.indexer import run_index
+
+    db_path = str(tmp_path_factory.mktemp("pair") / "pair.db")
+    with open_db(db_path) as db:
+        summary = run_index(db, pair_corpus.lib, workers=4,
+                            progress_stream=None)
+    assert summary["errors"] == 0
+    assert summary["indexed"] == len(SESSIONS)
+    return db_path

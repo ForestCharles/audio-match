@@ -143,6 +143,53 @@ def print_session_results(res: QueryResult, out=None) -> None:
       "  formats agree, which is weak evidence on its own.\n")
 
 
+def print_pair_results(res: QueryResult, out=None) -> None:
+    w = (out or sys.stdout).write
+    w("\n== MODE 3: pair mates (same session timeline) ==\n")
+    w(f"seed: {res.seed_path}\n")
+    w(f"seed length: {fmt_clock(res.seed_seconds)}\n")
+    sig = res.seed_signature
+    if sig is not None and sig.take is not None:
+        w(f"seed filename parsed as Tascam take {sig.take:04d}"
+          f"{' ' + sig.role if sig.role else ''}\n")
+    if res.pair_note:
+        w(f"\n  {res.pair_note}.\n")
+        return
+    if not res.pairs:
+        w("\n  no candidates.\n")
+        return
+
+    w("\n")
+    for i, h in enumerate(res.pairs, 1):
+        w(f"{i:2d}. [{h.verdict:^11s}] {_short(h.path, 60)}"
+          f"{' [missing]' if h.missing else ''}\n")
+        w(f"      length {fmt_clock(h.duration)}; the seed's 0:00 lands at "
+          f"{fmt_clock(h.alignment.lag_seconds)} in this file\n")
+        if h.missing:
+            w("      this path no longer exists; re-run 'audio-match index' "
+              "on its library root to prune it\n")
+        for line in h.evidence:
+            w(f"      - {line}\n")
+        w("\n")
+
+    w("  Two kinds of evidence, and they answer different questions.\n"
+      "  'envelope r' compares the 1 Hz loudness shape: it is what the\n"
+      "  PERFORMANCE did, so it survives different mics, gain, room position\n"
+      "  and an unsynchronised clock.  That is the evidence that finds a\n"
+      "  second recorder's capture.\n"
+      "  'acoustic coherence' compares the actual landmarks: it can only\n"
+      "  fire when the two files really share audio detail, which in practice\n"
+      "  means one recorder (a DR-40 S12/S34 pair) or two very similar mics.\n"
+      "  Its absence is NOT evidence against a pair.\n"
+      f"  PAIR needs r >= {config.PAIR_R_STRONG:.2f}, or coherence 'strong' "
+      f"with r >= {config.PAIR_R_LIKELY:.2f}.\n"
+      f"  LIKELY PAIR needs r >= {config.PAIR_R_LIKELY:.2f}.\n"
+      "  Anything that recorded the same hour will match, including a\n"
+      "  soundboard feed or somebody else's recorder.  That is usually what\n"
+      "  you want; when it is not, the take number and the coherence line\n"
+      "  are what single out one recorder's own dual-record mate.\n")
+
+
 # --------------------------------------------------------------------------
 # Commands
 # --------------------------------------------------------------------------
@@ -220,6 +267,8 @@ def cmd_query(args: argparse.Namespace) -> int:
         print_match_results(res)
     if args.mode in ("session", "both"):
         print_session_results(res)
+    if args.mode == "pair":
+        print_pair_results(res)
     return 0
 
 
@@ -328,8 +377,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     pq = sub.add_parser("query", help="search the index with a seed file")
     pq.add_argument("seed", help="audio file to search for")
-    pq.add_argument("--mode", choices=("match", "session", "both"),
-                    default="both")
+    pq.add_argument("--mode", choices=("match", "session", "both", "pair"),
+                    default="both",
+                    help="'match' = same audio, 'session' = same rig/room, "
+                         "'both' = those two (the default), 'pair' = other "
+                         "files that captured the same session timeline, "
+                         "including captures made on entirely different "
+                         "equipment (needs 'audio-match backfill' once on a "
+                         "database built before pair mode existed)")
     pq.add_argument("--top", type=int, default=10,
                     help="results per mode (default: 10)")
     pq.add_argument("--try-rates", action="store_true",

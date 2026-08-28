@@ -164,9 +164,11 @@ class Database:
         return None if row is None else str(row[0])
 
     def _set_meta(self, key: str, value: str) -> None:
+        # INSERT OR REPLACE rather than an upsert: ``ON CONFLICT ... DO UPDATE``
+        # needs sqlite >= 3.24, and this codebase already caters for the 3.22
+        # that ships with Ubuntu 20.04 (see the parameter cap in ``purge``).
         self.conn.execute(
-            "INSERT INTO meta(key, value) VALUES(?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
             (key, value))
 
     def _check_version(self) -> None:
