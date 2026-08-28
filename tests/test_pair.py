@@ -8,6 +8,7 @@ question, not one the seed's own recording could answer for it.
 
 from __future__ import annotations
 
+import io
 import os
 import re
 
@@ -19,12 +20,14 @@ from audiomatch.cli import main
 from audiomatch.db import open_db
 from audiomatch.indexer import run_index
 from audiomatch.query import (Coherence, PairHit, drift_grid, drift_slopes,
-                              fit_coherence, pair_search, run_query)
+                              fit_coherence, fit_coherence_global, pair_search,
+                              run_query)
 
-from conftest import (FALSE_PAIR_LIB_SECONDS, FALSE_PAIR_SEED_SECONDS,
-                      PAIR_EXCERPT_SECONDS, SESSIONS, FalsePairCorpus,
-                      PairCorpus, cut, requires_corpus, requires_earlier,
-                      requires_ffmpeg, run_ffmpeg)
+from conftest import (CLOSE_MIC_SECONDS, FALSE_PAIR_LIB_SECONDS,
+                      FALSE_PAIR_SEED_SECONDS, PAIR_EXCERPT_SECONDS, SESSIONS,
+                      CloseMicCorpus, FalsePairCorpus, PairCorpus, cut,
+                      requires_corpus, requires_earlier, requires_ffmpeg,
+                      run_ffmpeg)
 
 pytestmark = requires_ffmpeg
 
@@ -658,7 +661,10 @@ LONG = int(config.PAIR_ENVELOPE_TRUST_OVERLAP_SECONDS)
 
 
 def _hit(score: float, coherence: str = "none", overlap: int = LONG,
-         **kw) -> PairHit:
+         dominance: float = 2.0, **kw) -> PairHit:
+    """A synthetic hit.  The default alignment has a *dominant* envelope peak,
+    which is the ordinary case: 56 of the 56 correct pairs in the measured set
+    clear the bar and none of them is what the degenerate-peak path is for."""
     levels = {
         "strong": Coherence(votes=200, background=4),
         "weak": Coherence(votes=12, background=4),
@@ -667,7 +673,8 @@ def _hit(score: float, coherence: str = "none", overlap: int = LONG,
     assert levels[coherence].level == coherence
     return PairHit(file_id=1, path="/lib/x.wav", duration=float(overlap),
                    alignment=E.Alignment(ok=True, lag=0, score=score,
-                                         raw_r=score, overlap=overlap),
+                                         raw_r=score, overlap=overlap,
+                                         dominance=dominance),
                    coherence=levels[coherence], **kw)
 
 
@@ -829,3 +836,292 @@ def test_mode_both_is_unchanged_by_the_addition_of_pair_mode(pair_db,
     main(["--db", pair_db, "query", seed, "--mode", "both", "--top", "3"])
     out = capsys.readouterr().out
     assert "MODE 1" in out and "MODE 2" in out and "MODE 3" not in out
+
+
+# --------------------------------------------------------------------------
+# 7. The channel that hears one source instead of the room
+# --------------------------------------------------------------------------
+
+
+def test_peak_dominance_tells_one_answer_from_several():
+    """A dominant peak and a degenerate flat top, in isolation."""
+    lags = np.arange(-600, 601)
+
+    # One answer: a single song-scale bump, nothing else anywhere.
+    single = 0.9 * np.exp(-(lags / 20.0) ** 2)
+    assert E.peak_dominance(lags, single) > 100.0
+
+    # A rival 300 s away that is nearly as good: several answers, no winner.
+    twin = single + 0.87 * np.exp(-((lags - 300) / 20.0) ** 2)
+    assert E.peak_dominance(lags, twin) == pytest.approx(0.9 / 0.87, rel=1e-3)
+    assert E.peak_dominance(lags, twin) < config.PAIR_ENVELOPE_DOMINANCE_MIN
+
+    # A flat top: the argmax is whichever bin noise happened to favour.
+    flat = 0.5 + 0.004 * np.cos(lags / 31.0)
+    assert E.peak_dominance(lags, flat) < 1.02
+
+    # The rival has to be a *different alignment*, not the winning peak's own
+    # shoulder, which is what the 60 s separation buys: a peak wide enough to
+    # still be at 78% of its height a minute out is dominant, not degenerate.
+    broad = 0.9 * np.exp(-(lags / 120.0) ** 2)
+    assert broad[lags == 60][0] / broad.max() == pytest.approx(0.78, abs=0.01)
+    assert E.peak_dominance(lags, broad) > config.PAIR_ENVELOPE_DOMINANCE_MIN
+
+    # Degenerate inputs answer rather than divide by zero.
+    assert E.peak_dominance(lags, np.zeros_like(lags, dtype=float)) == 0.0
+    assert E.peak_dominance(lags, -np.abs(single)) == 0.0
+    assert E.peak_dominance(np.arange(3), np.array([0.1, 0.9, 0.2])) == np.inf
+
+
+#: Recorded peak geometry from the five-recorder live set, measured through
+#: ``align()``'s own score curve against hand-made (sesx) ground truth.
+#:
+#: One row per unordered pair of the nine files whose true offsets are known:
+#: ``(top1, top2, envelope lag error in seconds)``, where ``top2`` is the best
+#: score at least 60 s from ``top1`` -- the same rule
+#: :func:`envelope.peak_dominance` applies.  The reverse ordering of each pair
+#: measures identically, so the 36 rows here are the 72 ordered pairs.
+#:
+#: The eight rows with a lag error are every pair involving one direct-input
+#: channel; they are wrong by 103 s to 1644 s.
+MEASURED_PEAKS = (
+    (0.4565, 0.4507, 632), (0.4443, 0.4384, 452), (0.4915, 0.4781, 479),
+    (0.4964, 0.4823, 477), (0.6609, 0.6418, 271), (0.5256, 0.5103, 106),
+    (0.2629, 0.2472, 1644), (0.2789, 0.2542, 103),
+    (0.6476, 0.5417, 0), (0.6619, 0.5452, 0), (0.8224, 0.6652, 0),
+    (0.8813, 0.7008, 0), (0.9169, 0.7211, 0), (0.8017, 0.6250, 0),
+    (0.9402, 0.7287, 0), (0.8554, 0.6624, 0), (0.8992, 0.6954, 0),
+    (0.7802, 0.5963, 0), (0.9198, 0.6929, 0), (0.9176, 0.6888, 0),
+    (0.7316, 0.5448, 0), (0.6736, 0.4972, 0), (0.8979, 0.6605, 0),
+    (0.8714, 0.6379, 0), (0.9484, 0.6878, 0), (0.8527, 0.6182, 0),
+    (0.8888, 0.6414, 0), (0.6980, 0.4984, 0), (0.9530, 0.6609, 0),
+    (0.5539, 0.3796, 0), (0.5236, 0.3556, 0), (0.9321, 0.6235, 0),
+    (0.9203, 0.6127, 0), (0.8819, 0.5830, 0), (0.8911, 0.5879, 0),
+    (0.9130, 0.5779, 0),
+)
+
+
+def test_the_dominance_bar_sits_between_the_two_measured_populations():
+    """The trigger, on the geometry it was derived from.
+
+    This is the calibration, asserted: on real recordings with known true
+    offsets, every pair whose envelope lag is *wrong* has a degenerate peak
+    (1.013 .. 1.097) and every pair whose lag is *right* has a dominant one
+    (1.196 .. 1.580).  The two populations do not touch, and
+    ``PAIR_ENVELOPE_DOMINANCE_MIN`` sits in the gap.
+
+    If a future change to the score curve moves either population across the
+    bar, this fails -- which is the point.
+    """
+    lags = np.array([0, 100])          # 100 s apart: a genuine rival lag
+    wrong, right = [], []
+    for top1, top2, err in MEASURED_PEAKS:
+        dom = E.peak_dominance(lags, np.array([top1, top2]))
+        assert dom == pytest.approx(top1 / top2)
+        (wrong if err > 1 else right).append(dom)
+
+    assert len(wrong) == 8 and len(right) == 28          # 16 and 56, ordered
+    print(f"\nmeasured dominance: wrong lags "
+          f"{min(wrong):.3f}..{max(wrong):.3f}  correct lags "
+          f"{min(right):.3f}..{max(right):.3f}")
+    caught = [d for d in wrong if d < config.PAIR_ENVELOPE_DOMINANCE_MIN]
+    disturbed = [d for d in right if d < config.PAIR_ENVELOPE_DOMINANCE_MIN]
+    assert len(caught) == len(wrong), "a wrong envelope lag would go unchecked"
+    assert not disturbed, "a correct pair would be sent down the fallback"
+    assert max(wrong) < config.PAIR_ENVELOPE_DOMINANCE_MIN < min(right)
+
+
+def test_a_degenerate_envelope_peak_is_flagged_when_nothing_settles_it():
+    """The fallback ran (or could not run) and did not reach 'strong'.
+
+    The hit keeps its envelope verdict -- there is nothing better to replace it
+    with -- but the lag behind it is a coin flip, and the line says so.
+    """
+    hit = _hit(0.86, dominance=1.02)
+    assert hit.envelope_peak_is_degenerate
+    line = [ln for ln in hit.evidence if ln.startswith("envelope peak is not")]
+    assert len(line) == 1, hit.evidence
+    assert "score curve is degenerate" in line[0]
+    assert "lag unreliable" in line[0]
+    assert "close-mic/direct-input" in line[0]
+
+    # Not when the peak stands out...
+    assert not any(ln.startswith("envelope peak is not")
+                   for ln in _hit(0.86).evidence)
+    # ...nor when the landmarks confirmed the lag anyway...
+    confirmed = _hit(0.86, "strong", dominance=1.02)
+    assert not confirmed.envelope_peak_is_degenerate
+    assert not any(ln.startswith("envelope peak is not")
+                   for ln in confirmed.evidence)
+    # ...nor on a hit that is claiming nothing in the first place.
+    assert not any(ln.startswith("envelope peak is not")
+                   for ln in _hit(0.30, dominance=1.02).evidence)
+
+
+def test_a_fingerprint_placed_hit_never_prints_the_envelope_lag():
+    """The overridden lag must not survive anywhere in the output."""
+    hit = _hit(0.21, "strong", overlap=300, dominance=1.00,
+               fingerprint_placed=True,
+               superseded=E.Alignment(ok=True, lag=-1644, score=0.26,
+                                      raw_r=0.28, overlap=300,
+                                      dominance=1.00))
+    hit.alignment = E.Alignment(ok=True, lag=100, score=0.21, raw_r=0.21,
+                                overlap=300, dominance=1.00)
+    hit.coherence.offset_frames = int(round(100 / config.FRAME_SECONDS))
+
+    assert hit.verdict == "PAIR", "strong coherence placed it; that is enough"
+    assert not hit.capped_by_overlap
+    assert not hit.envelope_peak_is_degenerate
+    text = "\n".join(hit.evidence)
+    print("\n" + text)
+    assert text.startswith("placed by acoustic fingerprint despite an "
+                           "uninformative envelope -- typical of close-mic or "
+                           "direct-input channels")
+    assert "acoustic coherence: strong" in text
+    # The rejected lag appears only as the thing that was rejected.
+    assert "the envelope's own best lag was -1644s" in text
+    assert "peak dominance of 1.00" in text
+    assert not any(ln.startswith("envelope r=") for ln in hit.evidence)
+    # And the length cautions, which are all about trusting the envelope, are
+    # not printed over a verdict that does not rest on it.
+    assert "capped at TIMELINE MATCH" not in text
+    assert "very short overlap" not in text
+
+
+def test_the_unwindowed_search_is_sized_to_the_deltas_it_has():
+    """Range-sized, not window-sized -- the difference is 8.6 M bins.
+
+    Two hour-long files whose landmark deltas spread over three hours: the
+    histogram may be as big as what was actually observed and no bigger.  A
+    fixed half-window wide enough for any pair of files in a library (say a day
+    of possible offsets) is millions of bins per slope and seconds per
+    candidate, which is what made an unwindowed search look unaffordable.
+    """
+    rng = np.random.default_rng(11)
+    seed_frames = int(3600 * config.FRAME_RATE)
+    offset = int(round(1500.0 / config.FRAME_SECONDS))     # 25 minutes out
+    t = rng.integers(0, seed_frames, 600).astype(np.int64)
+    d = np.full(t.size, offset, dtype=np.int64)
+    span = int(round(3600.0 / config.FRAME_SECONDS))
+    noise_t = rng.integers(0, seed_frames, 40_000).astype(np.int64)
+    noise_d = rng.integers(-span, 2 * span, 40_000).astype(np.int64)
+    seed_t = np.concatenate([t, noise_t])
+    deltas = np.concatenate([d, noise_d])
+
+    import time
+    start = time.perf_counter()
+    c = fit_coherence_global(seed_t, deltas, seed_frames=seed_frames)
+    elapsed = time.perf_counter() - start
+    print(f"\nunwindowed search over {deltas.size:,} matched landmark pairs "
+          f"and {c.bins:,} bins ({c.slopes_tried} drift slopes): "
+          f"{elapsed * 1000:.0f} ms")
+
+    assert c.unwindowed and c.level == "strong"
+    assert abs(c.offset_frames - offset) <= 2
+    assert c.bins == int(deltas.max()) - int(deltas.min()) + 1
+    assert c.bins <= 3 * span + 2, "wider than the deltas that were observed"
+
+    naive = 2 * int(round(100_000.0 / config.FRAME_SECONDS)) + 1
+    assert naive > 8_000_000            # the allocation this test forbids
+    assert c.bins < naive / 10          # measured: 5.4% of it
+
+
+def test_the_unwindowed_search_declines_rather_than_allocating(monkeypatch):
+    """Above the bin ceiling it returns nothing instead of a huge array."""
+    monkeypatch.setattr(config, "PAIR_GLOBAL_COHERENCE_MAX_BINS", 1000)
+    rng = np.random.default_rng(5)
+    seed_frames = int(600 * config.FRAME_RATE)
+    t = rng.integers(0, seed_frames, 500).astype(np.int64)
+    d = rng.integers(0, 50_000, 500).astype(np.int64)
+    c = fit_coherence_global(t, d, seed_frames=seed_frames)
+    assert c.votes == 0 and c.level == "none" and c.bins == 0
+    # And a windowed fit of the same postings is unaffected by the ceiling.
+    assert fit_coherence(t, d, seed_frames=seed_frames,
+                         center_frames=0).bins > 1000
+
+
+def test_the_unwindowed_search_matches_the_windowed_one_where_they_overlap():
+    """Same machinery, same answer -- the window is the only difference."""
+    rng = np.random.default_rng(21)
+    seed_frames = int(2700 * config.FRAME_RATE)
+    offset = 43
+    t = np.sort(rng.integers(0, seed_frames, 3000)).astype(np.int64)
+    d = np.rint(offset + 120.0 * 1e-6 * t).astype(np.int64)
+    noise_t = rng.integers(0, seed_frames, 9000).astype(np.int64)
+    noise_d = rng.integers(-1200, 1200, 9000).astype(np.int64)
+    seed_t = np.concatenate([t, noise_t])
+    deltas = np.concatenate([d, noise_d])
+
+    win = fit_coherence(seed_t, deltas, seed_frames=seed_frames,
+                        center_frames=offset)
+    glob = fit_coherence_global(seed_t, deltas, seed_frames=seed_frames)
+    assert glob.level == win.level == "strong"
+    assert glob.votes == win.votes
+    assert glob.offset_frames == win.offset_frames
+    assert glob.drift_ppm == win.drift_ppm == pytest.approx(120.0, abs=30.0)
+
+
+@requires_ffmpeg
+def test_the_fingerprint_places_a_close_mic_seed_the_envelope_cannot(
+        close_mic_db, close_mic_corpus: CloseMicCorpus):
+    """The whole feature, end to end, on audio built to be this case.
+
+    The seed is a synthetic direct-input channel: an independent loud source
+    playing a repeating figure, with the room 25 dB down as bleed (see
+    ``close_mic_corpus``).  Its envelope therefore describes its own player,
+    not the performance, and proposes a lag ~100 s from the truth off a
+    completely degenerate score curve.  The landmarks in the bleed still know
+    the answer, and the unwindowed search is what asks them.
+    """
+    hits, seconds, _sig, note = _search(close_mic_db, close_mic_corpus.seed,
+                                        top=3)
+    assert not note, note
+    assert seconds == pytest.approx(CLOSE_MIC_SECONDS, abs=2.0)
+    assert len(hits) == 1
+    hit = hits[0]
+    a, sup, c = hit.alignment, hit.superseded, hit.coherence
+    assert hit.fingerprint_placed and sup is not None, (
+        "the envelope was believed here, so nothing exercised the fallback: "
+        + _report(hits))
+    print(f"\nclose-mic seed -> {os.path.basename(hit.path)} [{hit.verdict}]\n"
+          f"  envelope proposed lag {sup.lag_seconds:+.0f}s at dominance "
+          f"{sup.dominance:.3f} (score {sup.score:.3f})\n"
+          f"  unwindowed search: {c.votes} votes, {c.sharpness:.1f}x, offset "
+          f"{c.offset_seconds:+.2f}s over {c.bins:,} bins\n"
+          f"  adopted lag {a.lag_seconds:+.0f}s, envelope there "
+          f"r={a.raw_r:+.2f}")
+
+    # The premise: the envelope's answer is degenerate *and* wrong.
+    assert sup.dominance < config.PAIR_ENVELOPE_DOMINANCE_MIN, (
+        "the envelope peak is dominant here, so this test no longer "
+        "exercises the trigger")
+    assert abs(sup.lag - close_mic_corpus.true_lag) > \
+        config.PAIR_COHERENCE_WINDOW_SECONDS, (
+        "the envelope lag is close enough that the windowed pass would have "
+        "confirmed it, so nothing here needed the fallback")
+
+    # The finding: the landmarks placed it, to the second.
+    assert c.unwindowed and c.level == "strong"
+    assert c.offset_seconds == pytest.approx(close_mic_corpus.true_lag,
+                                             abs=1.0)
+    assert a.lag == pytest.approx(close_mic_corpus.true_lag, abs=1)
+    assert hit.verdict == "PAIR"
+
+    text = "\n".join(hit.evidence)
+    assert "placed by acoustic fingerprint despite an uninformative " \
+           "envelope -- typical of close-mic or direct-input channels" in text
+    assert f"the envelope's own best lag was {sup.lag_seconds:+.0f}s" in text
+    assert "acoustic coherence: strong" in text
+    assert not any(ln.startswith("envelope r=") for ln in hit.evidence)
+
+    # And it reads that way on the printed page, with the adopted lag.
+    from audiomatch.cli import print_pair_results
+    from audiomatch.query import QueryResult
+    out = io.StringIO()
+    print_pair_results(QueryResult(seed_path=close_mic_corpus.seed,
+                                   seed_seconds=seconds, pairs=hits), out)
+    printed = out.getvalue()
+    print(printed)
+    assert re.search(r"^ 1\. \[ *PAIR *\] ", printed, re.M), printed
+    assert "the seed's 0:00 lands at 1:40.0 in this file" in printed
+    assert "placed by acoustic fingerprint" in printed

@@ -469,11 +469,69 @@ recorder with different microphones may share no usable landmarks at all. So:
 > **`acoustic coherence: none` is not evidence against a pair.** It is the
 > expected reading for a genuine different-equipment capture.
 
+### When the envelope has no opinion worth confirming
+
+Confirming the envelope's lag only makes sense while that lag means something,
+and for one whole class of channel it does not. A DI, a board feed or a close
+vocal mic hears one source and hears the room only as bleed, so its loudness
+shape is one player's playing pattern rather than the performance's. Its
+correlation peak is then not low so much as **degenerate**: half a dozen
+unrelated lags score alike, and the winner is an argmax over noise that can be
+hundreds of seconds out. Confirming *that* within ±30 s asks the landmarks
+about the wrong part of the file, and they duly answer `none`.
+
+So mode 3 measures whether the peak is a peak, off the score curve it has
+already computed:
+
+```
+peak dominance = best score / best score at any lag ≥ 60 s away
+```
+
+The 60-second separation is what makes the denominator a *rival alignment*
+rather than the winner's own shoulder. Measured across all 72 ordered pairs of
+nine files whose true offsets are known from a hand-made session:
+
+| | peak dominance |
+| --- | --- |
+| pairs whose envelope lag is correct (56) | 1.196 … 1.580 |
+| pairs whose envelope lag is wrong (16) | 1.013 … 1.097 |
+
+The populations do not touch, so `PAIR_ENVELOPE_DOMINANCE_MIN = 1.15` sits in
+the gap: it fires on 16 of the 16 wrong lags and disturbs none of the 56 right
+ones.
+
+**When it fires, the landmark search is run again with its window removed.**
+Same drift grid, same smoothing, same bars — the only difference is that it
+searches the whole legal offset range instead of ±30 s around a lag nobody
+believes, and its sharpness is therefore measured against the tallest competing
+bin *anywhere*, which is a harder test rather than an easier one. The
+histogram is sized to the observed spread of the matched `(t_seed, t_library)`
+deltas: ~230 000 bins and ~101 ms per candidate, against the ~8.6 M bins and
+4.3 s a fixed window big enough for any pair of library files would cost. It
+only runs for a reported candidate whose peak is degenerate, whose windowed
+pass did not already confirm something, and which has enough matched landmarks
+to reach `strong` at all.
+
+Then, per candidate:
+
+* **the unwindowed search reaches `strong`** — its offset is adopted as *the*
+  alignment, the envelope is re-scored there rather than at the lag it
+  proposed, and the hit says
+  `placed by acoustic fingerprint despite an uninformative envelope`. Strong
+  coherence is already a PAIR verdict under the existing gate, and here it is
+  the only measurement in the room that is not blind to this channel;
+* **it does not** — the hit keeps its envelope verdict and gains
+  `envelope peak is not dominant (score curve is degenerate) — lag unreliable`.
+
+Measured on the five-recorder set: a direct-input channel whose envelope was
+103–1644 s wrong against all eight of its partners was placed by the unwindowed
+search to within **0.31 s in 8 cases out of 8**, on 19–255 votes.
+
 ### The verdict
 
 | Verdict | Requires |
 | --- | --- |
-| **PAIR** | score ≥ 0.80 **over ≥ 20 minutes of overlap**, **or** coherence `strong` with score ≥ 0.65 |
+| **PAIR** | score ≥ 0.80 **over ≥ 20 minutes of overlap**, **or** coherence `strong` with score ≥ 0.65, **or** the unwindowed landmark search placed the pair itself when the envelope's peak was degenerate |
 | **TIMELINE MATCH** | score ≥ 0.65 (loudness timelines align; unconfirmed — could be any capture of the same event) |
 | weak | anything below |
 
@@ -481,6 +539,12 @@ Two routes to PAIR, because one rig and two rigs leave different evidence.
 Coherence `strong` (≥ 30 aligned votes at ≥ 4× sharpness) essentially cannot
 happen by chance, so it promotes a merely-plausible envelope score at any
 length; but it can never rescue an envelope that disagrees about the timeline.
+
+The third route is the same evidence arriving without the envelope's help. When
+the envelope's peak is degenerate there is no lag for it to agree or disagree
+with, so requiring its score to clear 0.65 would be requiring corroboration from
+the one instrument already known to be blind to that channel — see
+[When the envelope has no opinion worth confirming](#when-the-envelope-has-no-opinion-worth-confirming).
 
 > **Seed pair mode with whole files, or at least twenty minutes.** Below that
 > the envelope alone cannot print PAIR, however high it scores, and the output
@@ -644,6 +708,35 @@ envelope match with no landmarks in common is the normal signature of a second
 recorder — and also what a supposed dual-record S12/S34 pair would look like if
 the two files were not in fact from one machine.
 
+**And here is a hit the envelope did not place at all.** The seed is a
+close-mic/direct-input channel: its own loud source plus the room 25 dB down as
+bleed, starting 1:40 into the library file. The envelope proposes −2 s off a
+completely flat score curve; the landmarks in the bleed know better:
+
+```
+ 1. [     PAIR     ] .../lib/room.wav
+      length 6:40.0; the seed's 0:00 lands at 1:40.0 in this file
+      - placed by acoustic fingerprint despite an uninformative envelope --
+        typical of close-mic or direct-input channels
+      - the envelope's own best lag was -2s, at a peak dominance of 1.00
+        against the 1.15 needed to be believed; at the offset above, the
+        envelope scores r=+0.21 over a 300s overlap
+      - acoustic coherence: strong (740 aligned landmark votes, 74.0x
+        sharpness, offset +99.99s, clock drift not measurable on a seed this
+        short)
+```
+
+The envelope line is *replaced*, not supplemented: the rejected lag appears
+only as the thing that was rejected, so nothing in the output — verdict,
+ranking, segment view or the "lands at" time — is still reading it. When the
+unwindowed search cannot place the pair either, the hit keeps its envelope
+verdict and gets a caution instead:
+
+```
+      - envelope peak is not dominant (score curve is degenerate) -- lag
+        unreliable; typical of close-mic/direct-input channels
+```
+
 ### The segment view
 
 The last line is for reading in terms of tracks rather than correlations. The
@@ -731,6 +824,22 @@ Files indexed after this change always get an envelope; `stats`, `index` and
   coherence-confirmed, with a worst-case envelope lag error of **0.47 s**
   against the hand-made ground truth. Length is the one input that improves
   every number in this mode at once.
+* **A channel that hears one source does not carry the session's envelope.** A
+  DI or board feed, or a close vocal mic, records the room only as bleed: its
+  loudness shape is one player's playing pattern, not the performance's. Mode
+  3's primary evidence is therefore uninformative for it — the correlation is
+  not weak so much as about the wrong thing, and its best lag can be hundreds
+  of seconds out while still scoring above the TIMELINE MATCH bar against
+  another close-source channel. Measured on a 63-minute direct input: **28% of
+  its seconds sit more than 40 dB below its own playing level**, against 0% for
+  every room mic in the same session, and its envelope correlation at the true
+  lag was **0.38** against its own dual-record mate, where mic-to-mic pairs run
+  0.79 … 0.97. The constellation index still holds the answer — bleed is enough
+  to place such a file to within 0.3 s — which is what the automatic
+  fingerprint fallback recovers (see
+  [When the envelope has no opinion worth confirming](#when-the-envelope-has-no-opinion-worth-confirming)).
+  When the fallback cannot place it either, the hit says the lag is unreliable
+  rather than standing behind it.
 * **Silence has no shape.** A file of room tone has a flat envelope and cannot
   be aligned to anything; mode 3 reports that rather than correlating noise.
 * **Drift beyond ±300 ppm is not searched**, and drift is not measurable at all
@@ -971,7 +1080,7 @@ cannot know what the columns it does not have are supposed to contain.
 
 ```bash
 pip install pytest
-python3 -m pytest tests/          # 124 tests, ~8 minutes warm
+python3 -m pytest tests/          # 132 tests, ~8 minutes warm
 ```
 
 The suite runs against the **real** recovered DR-40 corpus in
@@ -989,7 +1098,7 @@ than the 150 s that is plenty for the constellation. The four ground-truth
 queries share one set of seed analyses (a module-scoped fixture) for that
 reason.
 
-One of them is worth knowing about by name.
+Two of them are worth knowing about by name.
 `test_a_short_overlap_cannot_print_pair_on_the_envelope_alone` is the false-
 PAIR repro: five minutes of `pakDR40_S34` against ten minutes of
 `pakDR40_earlier`, two recordings that share no audio and no wall-clock time,
@@ -997,3 +1106,10 @@ which correlate at raw `r = +0.94` and once printed `[PAIR]`. It asserts both
 halves — that the score really is still that high, so the test keeps
 exercising the gate, and that the verdict is TIMELINE MATCH with the caution
 line attached.
+
+`test_the_fingerprint_places_a_close_mic_seed_the_envelope_cannot` is the
+other, and it needs no corpus: it builds a direct-input channel from scratch
+(an independent loud source with the room 25 dB down as bleed, 100 s out) and
+asserts that the envelope's peak really is degenerate and its lag really is
+wrong — so the test keeps exercising the trigger — and that the unwindowed
+landmark search then recovers the true offset and says so on the page.

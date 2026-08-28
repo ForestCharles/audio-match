@@ -33,6 +33,7 @@ between two captures at different gains, and a ratio is a difference in dB.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
@@ -173,6 +174,23 @@ class Alignment:
     raw_r: float = 0.0      # unshrunk Pearson r over the overlap
     overlap: int = 0        # samples of overlap at the winning lag
     reason: str = ""        # why ``ok`` is False
+    #: Winning score divided by the best score at any lag at least
+    #: ``config.PAIR_ENVELOPE_DOMINANCE_SEPARATION_SECONDS`` away from it --
+    #: see :func:`peak_dominance`.  ``inf`` means nothing else came close (or
+    #: there was no far-away lag to compare against); 0.0 means the question
+    #: does not arise, because there is no alignment or no positive peak.
+    dominance: float = 0.0
+
+    @property
+    def peak_is_dominant(self) -> bool:
+        """Is the winning lag a *distinct* answer, or one of several?
+
+        False means the score curve is degenerate -- several unrelated lags
+        score almost as well as the winner -- which is what a channel that
+        hears one source rather than the room looks like.  It says nothing
+        about whether the score is high.
+        """
+        return self.dominance >= config.PAIR_ENVELOPE_DOMINANCE_MIN
 
     @property
     def lag_seconds(self) -> float:
@@ -209,6 +227,77 @@ def _shrink(raw_r: np.ndarray, overlap: np.ndarray,
     relative = (overlap / max(1.0, max_overlap)) ** config.PAIR_OVERLAP_EXPONENT
     absolute = np.sqrt(overlap / (overlap + k))
     return raw_r * relative * absolute
+
+
+def peak_dominance(lags: np.ndarray, score: np.ndarray,
+                   best: Optional[int] = None) -> float:
+    """How far the winning lag stands above the rest of the score curve.
+
+    ``top1 / top2``, where ``top2`` is the best score at any lag at least
+    ``config.PAIR_ENVELOPE_DOMINANCE_SEPARATION_SECONDS`` from the winner.
+    The separation is what makes ``top2`` a *rival alignment* rather than the
+    shoulder of the winning peak, which at song scale is tens of seconds wide.
+
+    A dominant peak says "one lag explains this pair and the others do not".
+    A ratio near 1 says the opposite: several unrelated lags explain it about
+    equally well, so the winner is an argmax over noise and its lag cannot be
+    trusted -- see ``config.PAIR_ENVELOPE_DOMINANCE_MIN`` for the measured
+    separation between correct and wrong pairs.
+
+    Returns ``inf`` when there is no rival at all (nothing far enough away, or
+    nothing positive out there), and ``0.0`` when the winning score is not
+    positive, because "how many times better than the runner-up" is not a
+    question about a peak that is not a peak.
+    """
+    s = np.asarray(score, dtype=np.float64)
+    if s.size == 0:
+        return 0.0
+    idx = int(np.argmax(s)) if best is None else int(best)
+    top = float(s[idx])
+    if top <= 0.0:
+        return 0.0
+    far = (np.abs(np.asarray(lags, dtype=np.int64) - int(lags[idx]))
+           >= samples(config.PAIR_ENVELOPE_DOMINANCE_SEPARATION_SECONDS))
+    if not far.any():
+        return math.inf
+    second = float(s[far].max())
+    return top / second if second > 0.0 else math.inf
+
+
+def align_at(seed_db: np.ndarray, cand_db: np.ndarray, lag: int, *,
+             dominance: float = 0.0) -> Alignment:
+    """Score one *given* alignment instead of searching for the best one.
+
+    Used when something other than the envelope has decided where these two
+    files line up -- the unwindowed coherence fallback -- and the envelope's
+    opinion of that placement is still worth printing.  The arithmetic is
+    exactly :func:`align`'s, evaluated at a single lag: Pearson over the
+    overlap, then the same overlap shrinkage, so the number is comparable with
+    every other score in the mode.
+
+    The minimum-overlap rule is deliberately *not* applied.  It exists to stop
+    the search wandering onto the edges of two files, and there is no search
+    here; a placement backed by shared landmarks is entitled to be scored over
+    whatever overlap it implies, however thin, with the usual short-overlap
+    cautions doing their job downstream.
+    """
+    a = np.asarray(seed_db, dtype=np.float64)
+    b = np.asarray(cand_db, dtype=np.float64)
+    n, m = a.size, b.size
+    lo, hi = max(0, -int(lag)), min(n, m - int(lag))
+    if hi - lo < 2:
+        return Alignment(ok=False, lag=int(lag), dominance=dominance,
+                         reason="the offset leaves no overlap to score")
+    x = a[lo:hi]
+    y = b[lo + int(lag):hi + int(lag)]
+    L = float(x.size)
+    xc, yc = x - x.mean(), y - y.mean()
+    den = math.sqrt(float(xc @ xc) * float(yc @ yc))
+    raw = 0.0 if den <= _EPS else float(np.clip((xc @ yc) / den, -1.0, 1.0))
+    score = float(_shrink(np.array([raw]), np.array([L]),
+                          float(min(n, m)))[0])
+    return Alignment(ok=True, lag=int(lag), score=score, raw_r=raw,
+                     overlap=int(L), dominance=dominance)
 
 
 def _prefix(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -333,7 +422,8 @@ def _align_many_impl(seed_db: np.ndarray,
         best = int(np.argmax(score))
         results.append(Alignment(
             ok=True, lag=int(lags[best]), score=float(score[best]),
-            raw_r=float(raw[best]), overlap=int(L[best])))
+            raw_r=float(raw[best]), overlap=int(L[best]),
+            dominance=peak_dominance(lags, score, best)))
     return results
 
 

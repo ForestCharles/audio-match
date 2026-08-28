@@ -237,6 +237,100 @@ def false_pair_db(false_pair_corpus: FalsePairCorpus, tmp_path_factory) -> str:
     return db_path
 
 
+# --------------------------------------------------------------------------
+# A synthetic close-mic / direct-input channel
+# --------------------------------------------------------------------------
+
+#: The channel that hears one source instead of the room, built from scratch so
+#: that the true offset is known exactly and the test runs without the corpus.
+#:
+#: ``room.wav`` is 400 s of a "performance": pink noise gated by two
+#: incommensurate sines, so it starts and stops the way a set does.
+#: ``close.wav`` covers the same performance from 100 s later, but the way a DI
+#: or a close vocal mic does: an *independent* loud source (its own player,
+#: playing a repeating 43-second figure) with the room mixed in 25 dB down as
+#: bleed.
+#:
+#: What that produces, measured:
+#:
+#:   * the envelope's best lag is **-2 s** where the truth is **+100 s**, and
+#:     its peak dominance is **1.003** -- the loud source's repeating figure
+#:     lines up about equally well at a dozen different lags, so the argmax is
+#:     noise, which is precisely the geometry of the real DI channel;
+#:   * the windowed coherence pass around that lag finds ~9 votes: nothing;
+#:   * the *unwindowed* search over the same landmarks finds **740 votes at
+#:     74x sharpness, offset +99.99 s** -- 25 dB of bleed is plenty for the
+#:     constellation, which is the whole point.
+CLOSE_MIC_MASTER_SECONDS = 500.0
+CLOSE_MIC_SECONDS = 400.0
+#: Where the seed's 0:00 falls in the library file, in seconds.
+CLOSE_MIC_TRUE_LAG = 100
+#: Bleed level of the room in the close-mic file: -25 dB.
+CLOSE_MIC_BLEED = 0.056
+
+
+@dataclass
+class CloseMicCorpus:
+    lib: str          # directory holding room.wav
+    room: str
+    seed: str         # the close-mic capture
+    true_lag: int = CLOSE_MIC_TRUE_LAG
+
+
+@pytest.fixture(scope="session")
+def close_mic_corpus() -> CloseMicCorpus:
+    if not have_ffmpeg():
+        pytest.skip("ffmpeg unavailable")
+    root = os.path.join(SCRATCH, "closemic")
+    lib = os.path.join(root, "lib")
+    os.makedirs(lib, exist_ok=True)
+    c = CloseMicCorpus(lib=lib, room=os.path.join(lib, "room.wav"),
+                       seed=os.path.join(root, "close.wav"))
+    master = os.path.join(root, "master.wav")
+
+    def missing(path: str) -> bool:
+        return not (os.path.exists(path) and os.path.getsize(path) > 1024)
+
+    if missing(master):
+        run_ffmpeg([
+            "-f", "lavfi",
+            "-i", f"anoisesrc=d={CLOSE_MIC_MASTER_SECONDS:.0f}"
+                  f":c=pink:r=16000:a=0.5:seed=1",
+            "-filter_complex",
+            "[0:a]volume='0.03+0.97*gt(sin(2*PI*t/97)+sin(2*PI*t/53),0.35)'"
+            ":eval=frame,aformat=channel_layouts=stereo",
+            "-c:a", "pcm_s16le", master])
+    cut(master, c.room, 0.0, CLOSE_MIC_SECONDS)
+    if missing(c.seed):
+        run_ffmpeg([
+            "-ss", str(CLOSE_MIC_TRUE_LAG), "-t", f"{CLOSE_MIC_SECONDS:.0f}",
+            "-i", master,
+            "-f", "lavfi",
+            "-i", f"anoisesrc=d={CLOSE_MIC_SECONDS:.0f}"
+                  f":c=pink:r=16000:a=0.9:seed=7",
+            "-filter_complex",
+            f"[0:a]volume={CLOSE_MIC_BLEED}[bleed];"
+            "[1:a]volume='0.9*gt(sin(2*PI*t/43),0)':eval=frame,"
+            "aformat=channel_layouts=stereo[src];"
+            "[bleed][src]amix=inputs=2:normalize=0",
+            "-c:a", "pcm_s16le", c.seed])
+    return c
+
+
+@pytest.fixture(scope="session")
+def close_mic_db(close_mic_corpus: CloseMicCorpus, tmp_path_factory) -> str:
+    from audiomatch.db import open_db
+    from audiomatch.indexer import run_index
+
+    db_path = str(tmp_path_factory.mktemp("closemic") / "closemic.db")
+    with open_db(db_path) as db:
+        summary = run_index(db, close_mic_corpus.lib, workers=1,
+                            progress_stream=None)
+    assert summary["errors"] == 0
+    assert summary["indexed"] == 1
+    return db_path
+
+
 @pytest.fixture(scope="session")
 def pair_db(pair_corpus: PairCorpus, tmp_path_factory) -> str:
     from audiomatch.db import open_db

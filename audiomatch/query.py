@@ -28,6 +28,15 @@ Mode 3 (``pair``)
     recorder with different mics may share almost no landmarks at all.  So it
     confirms, and the envelope leads.
 
+    Unless the envelope cannot lead.  A channel that hears one source -- a DI
+    or board feed, a close vocal mic -- carries that source's playing pattern
+    and the room only as bleed, so its correlation peak is *degenerate*: half a
+    dozen unrelated lags score alike and the winner can be hundreds of seconds
+    out.  Pair mode measures that on the score curve it already has (peak
+    dominance) and, when the peak does not stand out, stops trusting the lag
+    and runs evidence 2 again with its window removed, letting the landmarks
+    place the two files by themselves.
+
     Because evidence 2 can only ever confirm, evidence 1 is never contradicted
     by anything -- so the *length* of the overlap has to do that job instead.
     Two unrelated recordings of the same band correlate at up to 0.838 over a
@@ -144,6 +153,13 @@ class Coherence:
     #: could have seen.  ``drift_ppm == 0`` with a non-zero resolution means
     #: "nothing above this was detected", not "the clocks agree exactly".
     drift_resolution_ppm: float = 0.0
+    #: True when this came from the *unwindowed* search -- an independent
+    #: placement of the two files rather than confirmation of the envelope's.
+    unwindowed: bool = False
+    #: Histogram bins actually allocated.  Reported because the unwindowed
+    #: search is only affordable while this stays sized to the observed delta
+    #: range; see ``config.PAIR_GLOBAL_COHERENCE_MAX_BINS``.
+    bins: int = 0
 
     @property
     def sharpness(self) -> float:
@@ -180,6 +196,29 @@ class PairHit:
     is_take_mate: bool = False
     is_seed_path: bool = False
     missing: bool = False
+    #: True when ``alignment``'s offset came from the *unwindowed* landmark
+    #: search rather than from the envelope, because the envelope's peak was
+    #: not dominant and the fingerprint found the pair anyway.
+    fingerprint_placed: bool = False
+    #: The envelope alignment that was discarded when that happened.  Kept so
+    #: the output can say what was rejected and why, rather than silently
+    #: printing a different lag from the one the envelope proposed.
+    superseded: Optional[env.Alignment] = None
+
+    @property
+    def envelope_peak_is_degenerate(self) -> bool:
+        """The envelope's best lag is one of several, and nothing settled it.
+
+        The score curve has a rival alignment within
+        ``PAIR_ENVELOPE_DOMINANCE_MIN`` of the winner (see
+        :func:`envelope.peak_dominance`), *and* neither the windowed coherence
+        nor the unwindowed fallback managed to place the pair independently.
+        Whatever this hit's score, its lag is a coin flip.
+        """
+        return (self.alignment.ok
+                and not self.alignment.peak_is_dominant
+                and not self.fingerprint_placed
+                and self.coherence.level != "strong")
 
     @property
     def envelope_is_trusted_alone(self) -> bool:
@@ -200,6 +239,7 @@ class PairHit:
         return (self.alignment.ok
                 and self.alignment.score >= config.PAIR_R_STRONG
                 and self.coherence.level != "strong"
+                and not self.fingerprint_placed
                 and not self.envelope_is_trusted_alone)
 
     @property
@@ -231,8 +271,21 @@ class PairHit:
         the honest verdict for a genuine different-recorder capture over a
         short overlap: the loudness timelines line up, and that is all anybody
         can tell from here.
+
+        There is a third route, and it is the same evidence arriving without
+        the envelope's help.  When the envelope's peak is not dominant its lag
+        is worthless, so "the envelope agrees" is not a question that can be
+        asked; the unwindowed landmark search then places the pair on its own,
+        and a 'strong' result there -- tens to hundreds of votes agreeing on
+        one line through (t_seed, t_lib), against the tallest competing bin
+        *anywhere* in the file -- is the stronger of the two measurements, not
+        the weaker.  Requiring the discarded envelope score to also clear
+        ``PAIR_R_LIKELY`` would be requiring corroboration from the one
+        instrument already known to be blind to this channel.
         """
         r = self.alignment.score
+        if self.fingerprint_placed:
+            return "PAIR"
         if not self.alignment.ok:
             return "weak"
         # Strong coherence is shared *audio detail*, not shared loudness, and
@@ -251,7 +304,29 @@ class PairHit:
         """One line per piece of evidence actually behind this verdict."""
         a = self.alignment
         out: list[str] = []
-        if a.ok:
+        if self.fingerprint_placed:
+            # The envelope lag has been thrown away, so it must not be printed
+            # as though it were still the answer.  What replaces it says both
+            # what placed this hit and what was rejected.
+            out.append(
+                "placed by acoustic fingerprint despite an uninformative "
+                "envelope -- typical of close-mic or direct-input channels")
+            sup = self.superseded
+            detail = ""
+            if sup is not None and sup.ok:
+                detail = (f"the envelope's own best lag was "
+                          f"{sup.lag_seconds:+.0f}s, at a peak dominance of "
+                          f"{sup.dominance:.2f} against the "
+                          f"{config.PAIR_ENVELOPE_DOMINANCE_MIN:.2f} needed "
+                          f"to be believed")
+            if a.ok:
+                scored = (f"at the offset above, the envelope scores "
+                          f"r={a.raw_r:+.2f} over a "
+                          f"{a.overlap_seconds:.0f}s overlap")
+                detail = f"{detail}; {scored}" if detail else scored
+            if detail:
+                out.append(detail)
+        elif a.ok:
             out.append(
                 f"envelope r={a.raw_r:+.2f} at lag {a.lag_seconds:+.0f}s "
                 f"(scored {a.score:+.2f} over a {a.overlap_seconds:.0f}s "
@@ -279,8 +354,17 @@ class PairHit:
                 f"votes, {c.sharpness:.1f}x sharpness, offset "
                 f"{c.offset_seconds:+.2f}s{drift})")
 
-        if a.ok and (a.overlap_seconds
-                     < config.PAIR_UNRELIABLE_OVERLAP_SECONDS):
+        if (self.envelope_peak_is_degenerate
+                and a.score >= config.PAIR_R_LIKELY):
+            # Only on hits that are claiming a timeline.  A 'weak' hit asserts
+            # no lag, so it needs no warning about the one it is not asserting.
+            out.append(
+                "envelope peak is not dominant (score curve is degenerate) -- "
+                "lag unreliable; typical of close-mic/direct-input channels")
+
+        if (a.ok and not self.fingerprint_placed
+                and a.overlap_seconds
+                < config.PAIR_UNRELIABLE_OVERLAP_SECONDS):
             # Louder than the gate caution, and unconditional: at this length
             # the correlation is unreliable in *both* directions, so it is not
             # only the high scores that need a health warning.
@@ -640,14 +724,74 @@ def fit_coherence(seed_t: np.ndarray, deltas: np.ndarray, *,
     """
     half = int(round(config.PAIR_COHERENCE_WINDOW_SECONDS
                      / config.FRAME_SECONDS))
-    width = 2 * half + 1
+    return _fit_offset_histogram(seed_t, deltas, seed_frames=seed_frames,
+                                 lo_frames=center_frames - half,
+                                 hi_frames=center_frames + half)
+
+
+def fit_coherence_global(seed_t: np.ndarray, deltas: np.ndarray, *,
+                         seed_frames: int) -> Coherence:
+    """The same fit, unwindowed: *where* do these two files line up?
+
+    :func:`fit_coherence` can only ever confirm the envelope, because it only
+    looks within ``PAIR_COHERENCE_WINDOW_SECONDS`` of the lag the envelope
+    proposed.  When the envelope's peak is not dominant that lag is not worth
+    confirming, and the honest thing is to ask the landmarks where the files
+    line up without telling them the answer first.
+
+    Same drift grid, same smoothing, same verdict bars -- the only difference
+    is the range searched, and therefore the background the sharpness is
+    measured against, which here is the tallest competing bin *anywhere* rather
+    than the tallest inside a 60-second window.  That is a harder test to pass,
+    not an easier one, which is what makes 'strong' from this search strong
+    enough to override the envelope.
+
+    The histogram is sized to the observed range of the matched deltas.  That
+    matters more than it looks: a fixed window big enough for any pair of files
+    in a library is ~8.6 M bins and 4.3 s per candidate, against ~230 000 bins
+    and ~101 ms when it is sized to the pairs actually in hand.  Above
+    ``config.PAIR_GLOBAL_COHERENCE_MAX_BINS`` the search declines rather than
+    allocating; the caller then keeps the envelope verdict and says the peak
+    was degenerate.
+
+    Measured on a five-recorder live set: a direct-input channel whose envelope
+    put it 103-1644 s wrong against all eight of its partners was placed by
+    this search to within 0.31 s in 8 cases out of 8, on 19-255 votes.
+    """
+    if deltas.size == 0:
+        return _blank_coherence(seed_frames)
+    lo_frames, hi_frames = int(deltas.min()), int(deltas.max())
+    if hi_frames - lo_frames + 1 > config.PAIR_GLOBAL_COHERENCE_MAX_BINS:
+        return _blank_coherence(seed_frames)
+    found = _fit_offset_histogram(seed_t, deltas, seed_frames=seed_frames,
+                                  lo_frames=lo_frames, hi_frames=hi_frames)
+    found.unwindowed = True
+    return found
+
+
+def _blank_coherence(seed_frames: int) -> Coherence:
+    slopes, step = drift_grid(seed_frames)
+    return Coherence(slopes_tried=int(slopes.size),
+                     drift_measurable=bool(slopes.size > 1),
+                     drift_resolution_ppm=step)
+
+
+def _fit_offset_histogram(seed_t: np.ndarray, deltas: np.ndarray, *,
+                          seed_frames: int, lo_frames: int,
+                          hi_frames: int) -> Coherence:
+    """The drift-fitted offset histogram over ``[lo_frames, hi_frames]``.
+
+    Shared by the windowed confirmation pass and the unwindowed search; the
+    range is the only thing that differs between them.
+    """
+    width = hi_frames - lo_frames + 1
     slopes, step = drift_grid(seed_frames)
     guard = 2 * config.OFFSET_SMOOTH + 1
     kernel = np.ones(guard, dtype=np.int64)
     blank = Coherence(slopes_tried=int(slopes.size),
                       drift_measurable=bool(slopes.size > 1),
-                      drift_resolution_ppm=step)
-    if deltas.size == 0:
+                      drift_resolution_ppm=step, bins=width)
+    if deltas.size == 0 or width <= 0:
         return blank
 
     seed_f = seed_t.astype(np.float64)
@@ -657,11 +801,11 @@ def fit_coherence(seed_t: np.ndarray, deltas: np.ndarray, *,
     # vote count is known before any other slope is judged against it.
     for ppm in slopes:
         shifted = deltas - (ppm * 1e-6) * seed_f
-        d = np.rint(shifted).astype(np.int64) - center_frames
-        sel = (d >= -half) & (d <= half)
+        d = np.rint(shifted).astype(np.int64)
+        sel = (d >= lo_frames) & (d <= hi_frames)
         if not sel.any():
             continue
-        counts = np.bincount(d[sel] + half, minlength=width)
+        counts = np.bincount(d[sel] - lo_frames, minlength=width)
         smoothed = (counts if config.OFFSET_SMOOTH <= 0
                     else np.convolve(counts, kernel, mode="same"))
         peak = int(np.argmax(smoothed))
@@ -677,11 +821,12 @@ def fit_coherence(seed_t: np.ndarray, deltas: np.ndarray, *,
         best = Coherence(
             votes=votes,
             background=int(away.max()) if away.size else 0,
-            offset_frames=peak - half + center_frames,
+            offset_frames=peak + lo_frames,
             drift_ppm=float(ppm),
             slopes_tried=int(slopes.size),
             drift_measurable=bool(slopes.size > 1),
-            drift_resolution_ppm=step)
+            drift_resolution_ppm=step,
+            bins=width)
     return best
 
 
@@ -746,8 +891,23 @@ def pair_search(db: Database, seed_path: str, *, top: int = 10,
     # does.  That is deliberate: a hash that occurs in thousands of files is
     # hum or hiss, and it says nothing about these two files just because only
     # two of them are being looked at right now.
+    #
+    # -- and, for a candidate whose envelope peak is *not dominant*, a second
+    # coherence pass with the window taken off (``fit_coherence_global``).  A
+    # close-mic or direct-input channel proposes a lag that can be hundreds of
+    # seconds wrong, so confirming it within +/-30 s asks the landmarks about
+    # the wrong part of the file and they answer "none" -- while the same
+    # landmarks, asked without the window, place the pair to within a third of
+    # a second.  The fallback only runs when the envelope has failed to name a
+    # single answer (dominance below ``PAIR_ENVELOPE_DOMINANCE_MIN``) and the
+    # windowed pass has not already confirmed one, and only for candidates with
+    # enough matched landmarks to reach 'strong' at all -- which is what keeps
+    # its ~101 ms per candidate off the ordinary query path entirely.
     coherence: dict[int, Coherence] = {}
+    global_coherence: dict[int, Coherence] = {}
     ids = {rows[i].id for i in chosen}
+    degenerate = {rows[i].id for i in chosen
+                  if not alignments[i].peak_is_dominant}
     seed_frames = int(round(seed.seconds * config.FRAME_RATE))
     if seed.hashes.size and ids:
         h, t = seed.hashes, seed.times
@@ -775,6 +935,12 @@ def pair_search(db: Database, seed_path: str, *, top: int = 10,
                     p_seed_t[lo:hi], p_deltas[lo:hi],
                     seed_frames=seed_frames,
                     center_frames=lag_frames.get(fid, 0))
+                if (fid in degenerate
+                        and coherence[fid].level != "strong"
+                        and hi - lo >= config.PAIR_COHERENCE_STRONG_VOTES):
+                    global_coherence[fid] = fit_coherence_global(
+                        p_seed_t[lo:hi], p_deltas[lo:hi],
+                        seed_frames=seed_frames)
 
     # -- supporting evidence, for every candidate that reached this far.
     seed_path_abs = os.path.abspath(seed_path)
@@ -784,14 +950,31 @@ def pair_search(db: Database, seed_path: str, *, top: int = 10,
     for i in chosen:
         row = rows[i]
         a = alignments[i]
+        coh = coherence.get(row.id, Coherence())
+        placed, superseded = False, None
+        found = global_coherence.get(row.id)
+        if found is not None and found.level == "strong":
+            # The unwindowed search placed the pair on its own.  Adopt it: the
+            # offset the landmarks agree on becomes *the* alignment, and the
+            # envelope is re-scored there rather than at the lag it proposed,
+            # so that nothing downstream -- verdict, ranking, segments, the
+            # printed "lands at" time -- is still reading a discarded lag.
+            coh = found
+            if (abs(found.offset_seconds - a.lag_seconds)
+                    > config.PAIR_COHERENCE_WINDOW_SECONDS):
+                placed, superseded = True, a
+                a = env.align_at(seed_db, cand_db[i],
+                                 env.samples(found.offset_seconds),
+                                 dominance=a.dominance)
         meta = db.file_row(row.id)
         session = (compare(seed.signature, meta.signature(),
                            ignore_filenames=ignore_filenames)
                    if meta is not None else None)
         hits.append(PairHit(
             file_id=row.id, path=row.path, duration=row.duration,
-            alignment=a, coherence=coherence.get(row.id, Coherence()),
+            alignment=a, coherence=coh,
             segments=env.compare_segments(seed_db, cand_db[i], a.lag),
+            fingerprint_placed=placed, superseded=superseded,
             session=session, take=row.take, role=row.role,
             is_take_mate=bool(
                 not ignore_filenames and seed.signature.take is not None

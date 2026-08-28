@@ -354,6 +354,48 @@ PAIR_COHERENCE_CANDIDATES = 20
 #: drift fit cheap enough to run on a 45-minute seed.
 PAIR_COHERENCE_WINDOW_SECONDS = 30.0
 
+#: Envelope *peak dominance*: how far the winning lag stands above the best
+#: competing lag more than ``PAIR_ENVELOPE_DOMINANCE_SEPARATION_SECONDS`` away
+#: from it, on the same per-lag score curve ``align()`` already computes.
+#:
+#: This is the trigger for the fingerprint fallback below, and it exists
+#: because of a whole class of channel the envelope cannot describe: a DI or
+#: board feed, or a close vocal mic, hears one source and hears the room only
+#: as bleed, so its 1 Hz loudness shape is one player's playing pattern rather
+#: than the performance's.  Its correlation against a room mic is then not so
+#: much weak as *about the wrong thing*, and its best lag can be hundreds of
+#: seconds out.  What that looks like on the score curve is not a low peak but
+#: a degenerate one -- a flat top with several near-equal contenders spread
+#: across the whole lag range.
+#:
+#: Measured on 72 ordered pairs of the nine ground-truth-known files of a
+#: five-recorder live set (sesx alignment as truth):
+#:
+#:     pairs whose envelope lag is correct (n=56)   1.196 .. 1.580
+#:     pairs whose envelope lag is wrong   (n=16)   1.013 .. 1.097
+#:
+#: The two ranges do not touch.  1.15 sits in the gap: it fires on 16 of the
+#: 16 wrong pairs and on 0 of the 56 correct ones.
+#:
+#: The 60-second separation is what makes the ratio mean "a different
+#: alignment" rather than "the shoulder of the same peak": an envelope peak is
+#: song-scale, tens of seconds wide, so a competitor must be a minute away
+#: before it is a rival answer rather than the same one.
+PAIR_ENVELOPE_DOMINANCE_MIN = 1.15
+PAIR_ENVELOPE_DOMINANCE_SEPARATION_SECONDS = 60.0
+
+#: Ceiling on the size of the *unwindowed* coherence histogram, in bins.
+#:
+#: The fallback search is sized to the observed range of the matched landmark
+#: deltas, which for two 45-minute files is ~230 000 bins -- measured at
+#: ~101 ms per candidate with all 25 drift slopes.  A window wide enough to
+#: cover any pair of files in a library would be ~8.6 M bins and 4.3 s per
+#: candidate, which is the mistake this constant is here to make impossible:
+#: above this many bins the fallback declines to run rather than allocating,
+#: and the hit keeps its envelope verdict plus the caution.  4 M bins is a
+#: delta span of about 26 hours, so no real pair of recordings reaches it.
+PAIR_GLOBAL_COHERENCE_MAX_BINS = 4_000_000
+
 #: Clock-drift search.  A drifting capture puts its matched landmark pairs on a
 #: *line* in (t_seed, t_lib) rather than in one offset bin, so the offset
 #: histogram is recomputed with the seed timestamps pre-compensated by each
