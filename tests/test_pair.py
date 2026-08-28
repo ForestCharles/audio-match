@@ -21,8 +21,10 @@ from audiomatch.indexer import run_index
 from audiomatch.query import (Coherence, PairHit, drift_grid, drift_slopes,
                               fit_coherence, pair_search, run_query)
 
-from conftest import (PAIR_EXCERPT_SECONDS, SESSIONS, PairCorpus, cut,
-                      requires_corpus, requires_ffmpeg, run_ffmpeg)
+from conftest import (FALSE_PAIR_LIB_SECONDS, FALSE_PAIR_SEED_SECONDS,
+                      PAIR_EXCERPT_SECONDS, SESSIONS, FalsePairCorpus,
+                      PairCorpus, cut, requires_corpus, requires_earlier,
+                      requires_ffmpeg, run_ffmpeg)
 
 pytestmark = requires_ffmpeg
 
@@ -51,7 +53,7 @@ def pair_results(pair_db, pair_corpus) -> dict:
 
 def _report(hits) -> str:
     return "\n".join(
-        f"  {i}. [{h.verdict:11s}] {os.path.basename(h.path):22s} "
+        f"  {i}. [{h.verdict:14s}] {os.path.basename(h.path):22s} "
         f"score {h.alignment.score:.3f} raw {h.alignment.raw_r:.3f} "
         f"lag {h.alignment.lag:+4d}s ov {h.alignment.overlap:4d}s  "
         f"coherence {h.coherence.level:6s} "
@@ -79,10 +81,17 @@ def test_the_dual_record_mate_is_ranked_first(pair_results, pair_corpus,
         0077      0.883   0.926    0s   289 / 26.3x
         pak       0.921   0.966    0s   115 /  6.4x
 
-    Every one of them clears ``PAIR_R_STRONG`` on the envelope alone, before
-    coherence is consulted; the best unrelated candidate in any of the four
-    queries reaches 0.620.  The 0072 margin over 0.80 is the thinnest at 0.02,
-    which is worth knowing if these thresholds are ever retuned.
+    Every one of them clears ``PAIR_R_STRONG`` on the envelope alone; the best
+    unrelated candidate in any of the four queries reaches 0.620.  The 0072
+    margin over 0.80 is the thinnest at 0.02, which is worth knowing if these
+    thresholds are ever retuned.
+
+    The *verdict*, though, does not rest on that score: a ten-minute excerpt
+    overlaps by 600 s, well under ``PAIR_ENVELOPE_TRUST_OVERLAP_SECONDS``, so
+    the envelope alone would be capped at TIMELINE MATCH here.  These four come
+    out PAIR because they are one recorder's two microphone pairs and their
+    coherence is strong -- which is the gate working as designed, not around
+    it.  See ``test_strong_coherence_lifts_a_short_overlap_to_pair``.
     """
     hits, seconds, _sig = pair_results[session]
     assert seconds == pytest.approx(PAIR_EXCERPT_SECONDS, abs=2.0)
@@ -94,8 +103,8 @@ def test_the_dual_record_mate_is_ranked_first(pair_results, pair_corpus,
 
     assert os.path.basename(best.path) == want, report
     assert best.verdict == "PAIR"
-    # The envelope alone must clear the PAIR bar -- coherence is a bonus here,
-    # not a crutch.
+    # The envelope alone must clear the PAIR bar; the length gate is what then
+    # asks for a second opinion, and coherence supplies it.
     assert best.alignment.score >= config.PAIR_R_STRONG
     # Same wall-clock range, so the two files line up at lag 0.  pakDR40_S12
     # has 0.74 s of silence prepended by the recovery, which is sub-sample at
@@ -104,7 +113,7 @@ def test_the_dual_record_mate_is_ranked_first(pair_results, pair_corpus,
     # Same recorder, same clock: coherence must fire.
     assert best.coherence.level == "strong"
     assert abs(best.coherence.offset_seconds) < 1.0
-    # And every unrelated session must stay below LIKELY PAIR.
+    # And every unrelated session must stay below TIMELINE MATCH.
     for other in hits[1:]:
         assert other.alignment.score < config.PAIR_R_LIKELY, report
         assert other.verdict == "weak"
@@ -183,7 +192,7 @@ def test_a_different_recorder_still_finds_the_counterpart(
     assert not note, note
     best = hits[0]
     report = "\n".join(
-        f"  [{h.verdict:11s}] {os.path.basename(h.path):22s} "
+        f"  [{h.verdict:14s}] {os.path.basename(h.path):22s} "
         f"score {h.alignment.score:.3f} raw {h.alignment.raw_r:.3f} "
         f"lag {h.alignment.lag:+4d}s coherence {h.coherence.level} "
         f"({h.coherence.votes} votes, ppm {h.coherence.drift_ppm:+.0f})"
@@ -192,7 +201,7 @@ def test_a_different_recorder_still_finds_the_counterpart(
 
     assert os.path.basename(best.path) == "TASCAM_0077S12.wav", report
     assert abs(best.alignment.lag) <= 2, report
-    assert best.verdict in ("PAIR", "LIKELY PAIR"), report
+    assert best.verdict in ("PAIR", "TIMELINE MATCH"), report
     assert best.alignment.score >= config.PAIR_R_LIKELY, report
     for other in hits[1:]:
         assert other.alignment.score < config.PAIR_R_LIKELY, report
@@ -274,22 +283,21 @@ def test_same_recorder_pairs_are_not_credited_with_a_drift(pair_results):
 
 
 @requires_corpus
-def test_unrelated_sessions_never_reach_likely_pair(pair_results,
-                                                    pair_corpus):
-    """The measured negative distribution, asserted.
+def test_unrelated_sessions_never_reach_timeline_match(pair_results,
+                                                       pair_corpus):
+    """The negative distribution of *these twelve pairs*, asserted.
 
-    Every seed against every library file it is *not* related to.  These are
-    the hardest negatives available: the same band, the same recorder, the
-    same room, sets of similar length and shape, recorded on different days.
+    Every seed against every library file it is *not* related to.  Measured
+    here (12 unrelated pairs, 10-minute excerpts): 0.141, 0.182, 0.259, 0.267,
+    0.304, 0.338, 0.347, 0.396, 0.417, 0.439, 0.568, 0.620 -- median 0.34,
+    ceiling 0.620.
 
-    Measured here (12 unrelated pairs, 10-minute excerpts): 0.141, 0.182,
-    0.259, 0.267, 0.304, 0.338, 0.347, 0.396, 0.417, 0.439, 0.568, 0.620 --
-    median 0.34, ceiling 0.620.  Measured on the *whole* files rather than
-    excerpts (48 unrelated ordered pairs): 0.402 .. 0.584, median 0.50,
-    against true pairs at 0.887 .. 0.937.
-
-    ``PAIR_R_LIKELY`` = 0.65 sits above both ceilings, but only by 0.03 over
-    the excerpt one, which is the tightest margin anywhere in this mode.
+    Twelve pairs is nowhere near enough to calibrate a threshold on, and this
+    test is not the calibration: a later sweep of ~15 000 - 22 000 negative
+    excerpt pairs found ceilings of 0.838 at a 5-minute overlap and 0.804 at
+    fifteen, which is what ``PAIR_ENVELOPE_TRUST_OVERLAP_SECONDS`` exists for.
+    What this test asserts is narrower and still worth having: on this corpus,
+    at this excerpt length, no unrelated file reaches even TIMELINE MATCH.
     """
     scores = []
     for session, (hits, _s, _sig) in sorted(pair_results.items()):
@@ -308,6 +316,101 @@ def test_unrelated_sessions_never_reach_likely_pair(pair_results,
     assert scores[-1][0] < config.PAIR_R_LIKELY, scores[-1]
 
 
+@requires_earlier
+def test_a_short_overlap_cannot_print_pair_on_the_envelope_alone(
+        false_pair_db, false_pair_corpus: FalsePairCorpus):
+    """The false-PAIR repro from the review of this mode, on real audio.
+
+    Seed: the first five minutes of ``pakDR40_S34``.  Library: 15:00-25:00 of
+    ``pakDR40_earlier`` -- a different recording, from a different part of the
+    card, with no shared audio and no shared wall-clock time.  Mode 1 on the
+    same two files shows 1.1x sharpness, i.e. nothing.
+
+    Measured before the length gate existed::
+
+        [PAIR] envelope r=+0.94 at lag +24s (scored +0.86 over a 300s overlap)
+               acoustic coherence: none
+
+    Every downstream line agreed with it, because coherence can only confirm
+    and the mode-2 score is supporting evidence.  Nothing could have caught it
+    except the one fact that was already on the page: 300 seconds is not
+    enough overlap for a loudness correlation to mean this.
+    """
+    hits, seconds, _sig, note = _search(false_pair_db,
+                                        false_pair_corpus.seed, top=5)
+    assert not note, note
+    assert seconds == pytest.approx(FALSE_PAIR_SEED_SECONDS, abs=2.0)
+    assert len(hits) == 1
+    hit = hits[0]
+    assert hit.duration == pytest.approx(FALSE_PAIR_LIB_SECONDS, abs=2.0)
+    print("\nfalse-pair repro ->\n" + _report(hits))
+
+    # The measurement this test is built on: still a high envelope score, still
+    # no coherence, still a short overlap.  If any of these stop holding, the
+    # test has stopped exercising the gate and should be re-derived.
+    assert hit.alignment.score >= config.PAIR_R_STRONG, _report(hits)
+    assert hit.coherence.level == "none", _report(hits)
+    assert (hit.alignment.overlap_seconds
+            < config.PAIR_ENVELOPE_TRUST_OVERLAP_SECONDS)
+    assert hit.alignment.overlap_seconds == pytest.approx(
+        FALSE_PAIR_SEED_SECONDS, abs=2.0)
+
+    assert hit.verdict != "PAIR", _report(hits)
+    assert hit.verdict == "TIMELINE MATCH", _report(hits)
+    assert hit.capped_by_overlap
+    text = "\n".join(hit.evidence)
+    assert "capped at TIMELINE MATCH" in text, text
+    assert "seed with the whole file" in text, text
+    # And the soft "no coherence over a long overlap" note must NOT appear:
+    # this overlap is not long, and the caution already says the useful thing.
+    assert "note: no shared-clock evidence" not in text, text
+
+
+@requires_earlier
+def test_the_false_pair_repro_reads_the_same_through_the_cli(
+        false_pair_db, false_pair_corpus: FalsePairCorpus, capsys):
+    """The verdict and both cautions have to survive to the printed page."""
+    assert main(["--db", false_pair_db, "query", false_pair_corpus.seed,
+                 "--mode", "pair"]) == 0
+    out = capsys.readouterr().out
+    print(out)
+    assert re.search(r"^ 1\. \[ *TIMELINE MATCH *\] ", out, re.M), out
+    assert "[     PAIR" not in out
+    # The per-hit caution, and the header one that fires on the seed length.
+    assert "short overlap (300s): envelope-only verdicts are capped" in out
+    assert "short seed (5:00.0): envelope-only verdicts are capped" in out
+    assert "20 minutes of overlap" in out
+    assert "seed with the whole file" in out
+    assert "TIMELINE MATCH needs r >= 0.65 and means the loudness timelines "\
+           "align" in out
+
+
+@requires_corpus
+@pytest.mark.parametrize("session", ["0048"])
+def test_strong_coherence_lifts_a_short_overlap_to_pair(pair_results,
+                                                        pair_corpus, session):
+    """The gate's bypass, on the real corpus.
+
+    A ten-minute S12/S34 excerpt pair overlaps by 600 s -- half of what the
+    envelope needs to speak on its own -- so this hit is PAIR only because the
+    two files share landmarks that agree on one offset.  That is exactly the
+    second opinion the gate asks for, and it must still be enough.
+    """
+    hits, _s, _sig = pair_results[session]
+    best = hits[0]
+    assert os.path.basename(best.path) == os.path.basename(
+        pair_corpus.lib_file(session))
+    assert (best.alignment.overlap_seconds
+            < config.PAIR_ENVELOPE_TRUST_OVERLAP_SECONDS), _report(hits)
+    assert not best.envelope_is_trusted_alone
+    assert best.coherence.level == "strong", _report(hits)
+    assert best.verdict == "PAIR", _report(hits)
+    # It was never capped, so it must not carry the caution.
+    assert not best.capped_by_overlap
+    assert not any("capped at TIMELINE MATCH" in line
+                   for line in best.evidence)
+
+
 @requires_corpus
 def test_every_reported_hit_gets_the_coherence_pass(pair_db, pair_corpus,
                                                     tmp_path):
@@ -318,8 +421,14 @@ def test_every_reported_hit_gets_the_coherence_pass(pair_db, pair_corpus,
     so the 21st hit printed "acoustic coherence: none -- consistent with a
     capture on different equipment" for a file whose landmarks had not been
     looked at once.  Here the seed's own envelope is planted in 20 decoy rows
-    so that they outrank the real dual-record mate, which then has to be
-    reported at rank 21 *with* its (strong) coherence.
+    so that they outrank the real dual-record mate *by envelope score*, which
+    then has to be reported with its (strong) coherence anyway.
+
+    The decoys score ~1.0 with no coherence at all, so the length gate demotes
+    every one of them to TIMELINE MATCH and the real mate is printed first --
+    which is the point of the gate, and the reason the "did it reach the
+    coherence pass?" assertion below is made against the envelope-score order
+    rather than the reported order.
     """
     import shutil
     import sqlite3
@@ -348,11 +457,17 @@ def test_every_reported_hit_gets_the_coherence_pass(pair_db, pair_corpus,
                                    top=config.PAIR_COHERENCE_CANDIDATES + 5)
     assert not note, note
     mate = os.path.basename(pair_corpus.lib_file("0077"))
-    rank = [i for i, h in enumerate(hits)
-            if os.path.basename(h.path) == mate]
-    assert rank, _report(hits)
-    assert rank[0] >= config.PAIR_COHERENCE_CANDIDATES, _report(hits)
-    assert hits[rank[0]].coherence.level == "strong", _report(hits)
+    found = [h for h in hits if os.path.basename(h.path) == mate]
+    assert found, _report(hits)
+    assert found[0].coherence.level == "strong", _report(hits)
+
+    by_score = sorted(hits, key=lambda h: -h.alignment.score)
+    place = [i for i, h in enumerate(by_score)
+             if os.path.basename(h.path) == mate][0]
+    assert place >= config.PAIR_COHERENCE_CANDIDATES, _report(by_score)
+    # The decoys are envelope-only, so none of them may claim to be a pair.
+    assert all(h.verdict == "TIMELINE MATCH"
+               for h in hits if h.path.startswith("/decoy/")), _report(hits)
 
 
 # --------------------------------------------------------------------------
@@ -538,29 +653,34 @@ def test_fit_coherence_with_no_postings_is_empty_not_an_error():
 # --------------------------------------------------------------------------
 
 
-def _hit(score: float, coherence: str = "none", **kw) -> PairHit:
+#: Long enough for the envelope to be trusted on its own.
+LONG = int(config.PAIR_ENVELOPE_TRUST_OVERLAP_SECONDS)
+
+
+def _hit(score: float, coherence: str = "none", overlap: int = LONG,
+         **kw) -> PairHit:
     levels = {
         "strong": Coherence(votes=200, background=4),
         "weak": Coherence(votes=12, background=4),
         "none": Coherence(),
     }
     assert levels[coherence].level == coherence
-    return PairHit(file_id=1, path="/lib/x.wav", duration=600.0,
+    return PairHit(file_id=1, path="/lib/x.wav", duration=float(overlap),
                    alignment=E.Alignment(ok=True, lag=0, score=score,
-                                         raw_r=score, overlap=600),
+                                         raw_r=score, overlap=overlap),
                    coherence=levels[coherence], **kw)
 
 
 def test_the_two_routes_to_a_pair_verdict():
-    # Envelope alone, when it is decisive.
+    # Envelope alone, when it is decisive *and* there is enough of it.
     assert _hit(0.90).verdict == "PAIR"
-    # Coherence promotes a merely-likely envelope score.
-    assert _hit(0.70).verdict == "LIKELY PAIR"
+    # Coherence promotes a merely-plausible envelope score.
+    assert _hit(0.70).verdict == "TIMELINE MATCH"
     assert _hit(0.70, "strong").verdict == "PAIR"
     # But coherence cannot rescue an envelope that disagrees.
     assert _hit(0.40, "strong").verdict == "weak"
     # Weak coherence is not a promotion.
-    assert _hit(0.70, "weak").verdict == "LIKELY PAIR"
+    assert _hit(0.70, "weak").verdict == "TIMELINE MATCH"
     assert _hit(0.64).verdict == "weak"
     # An unusable alignment is never a pair.
     bad = _hit(0.99)
@@ -568,9 +688,107 @@ def test_the_two_routes_to_a_pair_verdict():
     assert bad.verdict == "weak"
 
 
-def test_a_different_recorder_reads_as_likely_pair_not_a_failure():
+def test_the_envelope_alone_needs_a_long_overlap_to_say_pair():
+    """The length gate, at its boundary.
+
+    Below ``PAIR_ENVELOPE_TRUST_OVERLAP_SECONDS`` the measured negative
+    distribution reaches 0.838, so a high envelope score with nothing behind it
+    is not a pair verdict however high it goes.
+    """
+    assert _hit(0.99, overlap=LONG - 1).verdict == "TIMELINE MATCH"
+    assert _hit(0.99, overlap=LONG).verdict == "PAIR"
+    assert _hit(0.86, overlap=300).verdict == "TIMELINE MATCH"
+    # Weak coherence is not the second opinion the gate is asking for.
+    assert _hit(0.86, "weak", overlap=300).verdict == "TIMELINE MATCH"
+    # Strong coherence is, at any length: it needs genuinely shared audio.
+    assert _hit(0.86, "strong", overlap=300).verdict == "PAIR"
+    assert _hit(0.86, "strong", overlap=60).verdict == "PAIR"
+    # The gate cannot promote anything: it only ever holds a verdict back.
+    assert _hit(0.50, overlap=LONG * 4).verdict == "weak"
+
+
+def test_a_capped_hit_says_so_and_says_what_to_do_about_it():
+    hit = _hit(0.86, overlap=300)
+    assert hit.capped_by_overlap and not hit.envelope_is_trusted_alone
+    line = [ln for ln in hit.evidence if ln.startswith("short overlap")]
+    assert len(line) == 1, hit.evidence
+    assert "300s" in line[0]
+    assert "capped at TIMELINE MATCH" in line[0]
+    assert "1200s" in line[0]
+    assert "seed with the whole file" in line[0]
+    # No caution once the overlap is long enough...
+    assert not any(ln.startswith("short overlap")
+                   for ln in _hit(0.86).evidence)
+    # ...nor when coherence has already lifted the hit past the gate.
+    short_but_confirmed = _hit(0.86, "strong", overlap=300)
+    assert not short_but_confirmed.capped_by_overlap
+    assert not any(ln.startswith("short overlap")
+                   for ln in short_but_confirmed.evidence)
+    # ...nor for a score that was never near PAIR anyway.
+    assert not any(ln.startswith("short overlap")
+                   for ln in _hit(0.70, overlap=300).evidence)
+
+
+def test_a_very_short_overlap_is_flagged_whatever_the_verdict():
+    """Below five minutes the correlation fails in *both* directions.
+
+    Measured against ground truth on a five-recorder live set: a 61-second seed
+    scored r = -0.52 against its own true dual-record mate (ranked 15th of 16),
+    and a 112-second seed returned seven mutually contradictory matches at
+    implied lags from 919 s to 2473 s.  So the warning cannot be limited to
+    hits the PAIR gate holds back -- a *missed* mate looks like a weak hit, and
+    it needs the same health warning.
+    """
+    for score in (0.90, 0.70, 0.30):
+        hit = _hit(score, overlap=112)
+        line = [ln for ln in hit.evidence
+                if ln.startswith("very short overlap")]
+        assert len(line) == 1, (score, hit.evidence)
+        assert "112s" in line[0]
+        assert "unreliable in both directions" in line[0]
+        assert "capped at TIMELINE MATCH below 1200s" in line[0]
+        assert "seed with the whole file" in line[0]
+        # One caution, not two: this line already names the cap.
+        assert not any(ln.startswith("short overlap") for ln in hit.evidence)
+
+    # It is about the overlap, not the verdict: strong coherence buys a PAIR
+    # here and the warning stays.
+    confirmed = _hit(0.90, "strong", overlap=112)
+    assert confirmed.verdict == "PAIR"
+    assert any(ln.startswith("very short overlap")
+               for ln in confirmed.evidence)
+
+    # Just above the line, the milder gate caution takes over.
+    boundary = _hit(0.90, overlap=int(config.PAIR_UNRELIABLE_OVERLAP_SECONDS))
+    assert not any(ln.startswith("very short") for ln in boundary.evidence)
+    assert any(ln.startswith("short overlap") for ln in boundary.evidence)
+
+
+def test_a_long_overlap_with_no_coherence_at_all_is_annotated():
+    """Soft, informational, and never a verdict change.
+
+    A long envelope match with no shared landmarks whatsoever is the normal
+    reading for a second recorder -- and also what a pair of files that are
+    *supposed* to be one recorder's two microphone pairs would look like if
+    they were not.  The tool cannot tell which, so it says so and leaves the
+    verdict alone.
+    """
+    hit = _hit(0.86)
+    assert hit.verdict == "PAIR"
+    note = [ln for ln in hit.evidence if ln.startswith("note:")]
+    assert len(note) == 1, hit.evidence
+    assert "no shared-clock evidence despite a long overlap" in note[0]
+    assert "suspicious if these files should share a recorder" in note[0]
+    # Not on a short overlap (that hit gets the caution instead), not when
+    # coherence fired, and not below the PAIR bar.
+    for other in (_hit(0.86, overlap=300), _hit(0.86, "strong"),
+                  _hit(0.86, "weak"), _hit(0.70)):
+        assert not any(ln.startswith("note:") for ln in other.evidence), other
+
+
+def test_a_different_recorder_reads_as_timeline_match_not_a_failure():
     hit = _hit(0.72, "none")
-    assert hit.verdict == "LIKELY PAIR"
+    assert hit.verdict == "TIMELINE MATCH"
     text = "\n".join(hit.evidence)
     assert "coherence: none" in text
     assert "different equipment" in text

@@ -27,6 +27,13 @@ Mode 3 (``pair``)
     Evidence 2 is decisive when it fires and silent when it does not: a second
     recorder with different mics may share almost no landmarks at all.  So it
     confirms, and the envelope leads.
+
+    Because evidence 2 can only ever confirm, evidence 1 is never contradicted
+    by anything -- so the *length* of the overlap has to do that job instead.
+    Two unrelated recordings of the same band correlate at up to 0.838 over a
+    five-minute overlap, which is above the PAIR bar, so below
+    ``config.PAIR_ENVELOPE_TRUST_OVERLAP_SECONDS`` of overlap the envelope
+    alone tops out at TIMELINE MATCH.
 """
 
 from __future__ import annotations
@@ -175,32 +182,68 @@ class PairHit:
     missing: bool = False
 
     @property
-    def verdict(self) -> str:
-        """``'PAIR'`` | ``'LIKELY PAIR'`` | ``'weak'``.
+    def envelope_is_trusted_alone(self) -> bool:
+        """Is this overlap long enough for the envelope to speak unsupported?
 
-        Two independent routes to PAIR, because two different rigs and one
-        rig produce different evidence:
+        Below ``config.PAIR_ENVELOPE_TRUST_OVERLAP_SECONDS`` the measured
+        negative distribution reaches into the PAIR range (0.838 at a 5-minute
+        overlap, 0.804 at fifteen), so an envelope score on its own is not
+        evidence of a pair however high it is.
+        """
+        return (self.alignment.ok
+                and self.alignment.overlap_seconds
+                >= config.PAIR_ENVELOPE_TRUST_OVERLAP_SECONDS)
+
+    @property
+    def capped_by_overlap(self) -> bool:
+        """True when only the length gate is keeping this hit off PAIR."""
+        return (self.alignment.ok
+                and self.alignment.score >= config.PAIR_R_STRONG
+                and self.coherence.level != "strong"
+                and not self.envelope_is_trusted_alone)
+
+    @property
+    def verdict(self) -> str:
+        """``'PAIR'`` | ``'TIMELINE MATCH'`` | ``'weak'``.
+
+        Two independent routes to PAIR, because one rig and two rigs leave
+        different evidence:
 
         * coherence is strong -- the two files share landmarks that all agree
           on one line through (t_seed, t_lib), which essentially cannot happen
           by chance -- *and* the envelope agrees it is the same timeline; or
         * the envelope correlation alone is high enough that no measured
-          unrelated pair comes near it (see ``config.PAIR_R_STRONG``).
+          unrelated pair comes near it (``config.PAIR_R_STRONG``) **and** the
+          two files overlap for long enough that this is a meaningful thing to
+          say (``config.PAIR_ENVELOPE_TRUST_OVERLAP_SECONDS``).
 
-        Everything above ``PAIR_R_LIKELY`` and below that is LIKELY PAIR, which
-        is the honest verdict for a genuine different-recorder capture: the
-        timeline matches, and there is no second piece of evidence available
-        because there could not be.
+        That second condition is the length gate, and it is not decoration.
+        Over ~15 000 - 22 000 genuine negative pairs the envelope score of two
+        *unrelated* recordings reaches 0.838 on a 5-minute overlap and 0.804 on
+        a 15-minute one -- above the PAIR bar, on real audio, with the segment
+        and session lines agreeing.  Since coherence can only ever confirm the
+        envelope and never contradict it, nothing downstream could have caught
+        those.  Below 20 minutes of overlap, therefore, the envelope alone can
+        say TIMELINE MATCH and no more.
+
+        TIMELINE MATCH is everything above ``PAIR_R_LIKELY`` that is not a
+        PAIR, including a high-scoring hit held back by the gate.  It is also
+        the honest verdict for a genuine different-recorder capture over a
+        short overlap: the loudness timelines line up, and that is all anybody
+        can tell from here.
         """
         r = self.alignment.score
         if not self.alignment.ok:
             return "weak"
+        # Strong coherence is shared *audio detail*, not shared loudness, and
+        # is what the gate is asking for; it therefore lifts a hit to PAIR at
+        # any overlap, exactly as it did before the gate existed.
         if self.coherence.level == "strong" and r >= config.PAIR_R_LIKELY:
             return "PAIR"
-        if r >= config.PAIR_R_STRONG:
+        if r >= config.PAIR_R_STRONG and self.envelope_is_trusted_alone:
             return "PAIR"
         if r >= config.PAIR_R_LIKELY:
-            return "LIKELY PAIR"
+            return "TIMELINE MATCH"
         return "weak"
 
     @property
@@ -235,6 +278,38 @@ class PairHit:
                 f"acoustic coherence: {c.level} ({c.votes} aligned landmark "
                 f"votes, {c.sharpness:.1f}x sharpness, offset "
                 f"{c.offset_seconds:+.2f}s{drift})")
+
+        if a.ok and (a.overlap_seconds
+                     < config.PAIR_UNRELIABLE_OVERLAP_SECONDS):
+            # Louder than the gate caution, and unconditional: at this length
+            # the correlation is unreliable in *both* directions, so it is not
+            # only the high scores that need a health warning.
+            out.append(
+                f"very short overlap ({a.overlap_seconds:.0f}s): below "
+                f"{config.PAIR_UNRELIABLE_OVERLAP_SECONDS:.0f}s this "
+                f"correlation is unreliable in both directions -- true pairs "
+                f"have scored negative at the correct lag and unrelated files "
+                f"have produced contradictory matches -- and envelope-only "
+                f"verdicts are capped at TIMELINE MATCH below "
+                f"{config.PAIR_ENVELOPE_TRUST_OVERLAP_SECONDS:.0f}s; seed "
+                f"with the whole file")
+        elif self.capped_by_overlap:
+            out.append(
+                f"short overlap ({a.overlap_seconds:.0f}s): envelope-only "
+                f"verdicts are capped at TIMELINE MATCH below "
+                f"{config.PAIR_ENVELOPE_TRUST_OVERLAP_SECONDS:.0f}s, because "
+                f"unrelated recordings score this high over an overlap this "
+                f"short; for full confidence seed with the whole file")
+        elif (c.level == "none" and self.envelope_is_trusted_alone
+                and a.score >= config.PAIR_R_STRONG):
+            # Informational only -- this never changes the verdict.  A
+            # long-overlap envelope match with no shared landmarks at all is
+            # exactly what a second recorder looks like, and exactly what a
+            # mislabelled "dual-record mate" would look like too.
+            out.append(
+                "note: no shared-clock evidence despite a long overlap -- "
+                "expected for different-recorder captures; suspicious if "
+                "these files should share a recorder")
 
         if self.is_take_mate:
             out.append(f"filename: dual-record pair-mate of the seed "
@@ -730,7 +805,7 @@ def pair_search(db: Database, seed_path: str, *, top: int = 10,
     # line with the seed is as close to proof as this tool gets, and burying
     # it under a slightly higher envelope score with no second evidence behind
     # it would be the wrong way round.
-    rank = {"PAIR": 0, "LIKELY PAIR": 1, "weak": 2}
+    rank = {"PAIR": 0, "TIMELINE MATCH": 1, "weak": 2}
     hits.sort(key=lambda h: (rank[h.verdict], -h.alignment.score, h.path))
     return hits[:top], seed.seconds, seed.signature, ""
 

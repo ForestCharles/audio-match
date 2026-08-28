@@ -259,7 +259,39 @@ ENVELOPE_LEVELS = 256
 #: At 1 Hz a 30-second seed is 30 numbers; correlated against a few hundred
 #: candidate lags, r > 0.8 happens by chance routinely.  Pair mode refuses
 #: rather than reporting a number it does not believe.
+#:
+#: This is the *rejection* floor and is deliberately not the recommended one.
+#: It says "below this there is nothing to compute", not "above this the answer
+#: is any good"; see ``PAIR_UNRELIABLE_OVERLAP_SECONDS`` for what the numbers
+#: actually do just above it.
 PAIR_MIN_ENVELOPE_SECONDS = 60.0
+
+#: Overlap below which the envelope correlation is not to be trusted in
+#: *either* direction, and every hit says so.
+#:
+#: Validation against human-made alignment ground truth on a five-recorder live
+#: set (four DR-40s plus one other machine) put numbers on how bad a one- or
+#: two-minute seed is, and it is worse than "not confident":
+#:
+#:   * a 61-second seed correlated with its own true dual-record mate at
+#:     r = **-0.52** at the correct lag -- a negative correlation for two
+#:     microphones on one recorder, three seconds apart -- and ranked it 15th
+#:     of 16 candidates;
+#:   * a 112-second seed returned *seven* confident-looking timeline matches
+#:     against unrelated hour-long files, at implied lags spanning 919 s to
+#:     2473 s.  No set of recordings can satisfy all seven at once, so at least
+#:     six were wrong, and the seed's true mate came 14th.
+#:
+#: So the failure at this length is symmetric: false matches *and* missed true
+#: ones.  Five minutes is the practical floor, and whole files are what the
+#: mode is for -- the same validation seeded with full 62-65 minute files got
+#: 50 of 53 pairs, every one coherence-confirmed, with a worst envelope lag
+#: error of 0.47 s.
+#:
+#: Seeds between 60 s and this are still answered rather than refused: the
+#: alignment is sometimes right, and a lead the user can audition is worth more
+#: than a refusal.  It is labelled, loudly, on every hit.
+PAIR_UNRELIABLE_OVERLAP_SECONDS = 300.0
 
 #: Required overlap between seed and candidate:
 #: ``max(PAIR_MIN_ENVELOPE_SECONDS, min(300 s, 50% of the shorter file))``.
@@ -369,29 +401,67 @@ PAIR_COHERENCE_STRONG_SHARPNESS = 4.0
 PAIR_COHERENCE_WEAK_VOTES = 8
 PAIR_COHERENCE_WEAK_SHARPNESS = 2.0
 
-#: Verdict thresholds on the penalised envelope correlation.  Measured on the
-#: whole recovered corpus (see ``PAIR_OVERLAP_EXPONENT`` for the method):
+#: Verdict thresholds on the penalised envelope correlation.
 #:
-#:                             whole files        10-minute excerpts
-#:     true S12/S34 pairs      0.887 .. 0.937     0.820 .. 0.921  (n=4)
-#:     unrelated pairs         0.402 .. 0.584     0.141 .. 0.620  (n=12)
+#: These were originally calibrated on whole files and on the 12 unrelated
+#: 10-minute excerpt pairs the test suite happens to produce, whose ceiling was
+#: 0.620.  That sample was far too small, and its comfortable-looking 0.03 of
+#: margin was an artefact of it.  A later sweep over ~15 000 - 22 000 *genuine
+#: negative* pairs -- non-overlapping excerpts cut from the real recovered
+#: corpus, so the same band, the same room and often the same recorder on both
+#: sides -- measured the negative distribution properly, and it depends far
+#: more on the length of the overlap than on anything else:
 #:
-#: The unrelated set is the *hardest* available negative class -- the same
-#: band, the same rig, the same room, sets of similar length and shape on
-#: different days -- so those ceilings are realistic rather than flattering.
-#: PAIR at 0.80 sits in empty space in both columns.  LIKELY PAIR at 0.65 has
-#: room on whole files and only 0.03 on excerpts, which is the thinnest margin
-#: anywhere in this mode and the reason the README tells people to seed with as
-#: much of the recording as they have.
+#:     overlap        negative score ceiling      true pairs at that length
+#:      5 min         0.838   (18 scored >= 0.80)  20 of 90 fell below 0.80
+#:     10 min         0.810
+#:     15 min         0.804
+#:     20 min         0.696
+#:     30 min         0.568
+#:     whole files    0.584
 #:
-#: A degraded different-recorder capture lands between the two, which is what
-#: LIKELY PAIR is for.  (The test suite's simulated second rig -- 104 ppm
-#: resample, EQ tilt, echo, -6 dB, 128k mp3 -- actually scores 0.871 and keeps
-#: its coherence, so it comes out PAIR; a real second rig across the room, with
-#: different capsules pointing somewhere else, is the harsher case this
-#: threshold is really aimed at.)
+#: So 0.80 and 0.65 are honest thresholds *for a long overlap* and nowhere
+#: near safe for a short one, where the two distributions overlap outright.
+#: The thresholds are left where they are -- moving them would cost the
+#: long-overlap case its sensitivity to fix a problem that is really about
+#: length -- and the length itself is gated separately, by
+#: ``PAIR_ENVELOPE_TRUST_OVERLAP_SECONDS`` below.
+#:
+#: A degraded different-recorder capture typically lands between the two, which
+#: is what TIMELINE MATCH is for.  (The test suite's simulated second rig --
+#: 104 ppm resample, EQ tilt, echo, -6 dB, 128k mp3 -- actually scores 0.871
+#: and keeps its coherence, so it comes out PAIR; a real second rig across the
+#: room, with different capsules pointing somewhere else, is the harsher case
+#: these thresholds are really aimed at.)
 PAIR_R_STRONG = 0.80
 PAIR_R_LIKELY = 0.65
+
+#: Overlap below which the envelope score *alone* may not print PAIR.
+#:
+#: The envelope is the only evidence in this mode that always fires, and it is
+#: unfalsifiable on its own: coherence can confirm a high r but nothing can
+#: refute one, so whatever the envelope says at the top of the range is what
+#: gets printed.  That is only safe while the negative distribution stays well
+#: below ``PAIR_R_STRONG``, and the table above shows exactly where it stops
+#: doing so: negative ceilings of 0.804 at a 15-minute overlap and 0.810 at
+#: ten, against 0.696 at twenty and 0.568 at thirty.  The cliff is between 15
+#: and 20 minutes.
+#:
+#: The reason is the overlap penalty, which is meant to be doing this job and
+#: has already stopped: ``sqrt(L / (L + 60))`` is 0.91 at five minutes and 0.98
+#: at twenty, so from five minutes on it discounts essentially nothing, while
+#: the *relative* term is 1 whenever the best lag uses all the overlap there is
+#: -- which, for a short seed inside a long library file, is most lags.  Two
+#: unrelated sets by the same band, five minutes each, really can correlate at
+#: 0.84 once both are shrunk to their loud middles.
+#:
+#: 20 minutes is the shortest overlap at which the measured negatives clear
+#: ``PAIR_R_STRONG`` by a real margin (0.10).  Below it the envelope alone is
+#: capped at TIMELINE MATCH.  Strong coherence still elevates a hit to PAIR at
+#: any overlap: landmarks lying on one line through (t_seed, t_lib) require
+#: genuinely shared audio, so that is the second, independent piece of evidence
+#: this gate exists to demand.
+PAIR_ENVELOPE_TRUST_OVERLAP_SECONDS = 1200.0
 
 #: Segment display only -- never scoring.  The aligned envelopes are smoothed
 #: over ``SMOOTH`` seconds and thresholded at ``FRACTION`` of the way from the

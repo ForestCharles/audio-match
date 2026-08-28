@@ -12,7 +12,8 @@ Find, in a very large library of audio files:
    including captures made on entirely different equipment: another recorder,
    other microphones, an unsynchronised clock and a different start time. This
    mode works from the loudness envelope of the performance, which every
-   microphone in the room heard the same way.
+   microphone in the room heard the same way. Seed it with whole files: its
+   evidence is a correlation, and correlations need length.
 
 Built for a ~1.45 TB library of Tascam DR-40 WAVs on a Linux server. One
 indexing pass, one SQLite file, three query modes.
@@ -49,6 +50,7 @@ audio-match index /mnt/library
 audio-match query ~/seed.wav
 
 # What else was recording while this was recorded?
+# (seed this one with the whole file: see "Mode 3" for why length matters)
 audio-match query ~/seed.wav --mode pair
 ```
 
@@ -324,6 +326,15 @@ something true and leaving the judgement to you.
 > **New databases get this automatically. An index built before mode 3 existed
 > needs one `audio-match backfill` pass first — not a re-index.** See
 > [Backfilling an older index](#backfilling-an-older-index).
+>
+> **Seed this mode with whole files.** Its primary evidence is a loudness
+> correlation, and a loudness correlation over a short overlap is not worth
+> much: measured on this corpus, *unrelated* recordings reach 0.838 over a
+> five-minute overlap against a PAIR bar of 0.80, and a one-minute seed has
+> scored **−0.52 against its own true mate**. Five minutes is the floor,
+> twenty is where the envelope is allowed to claim a pair by itself, and whole
+> files are the intended use. See [The verdict](#the-verdict) and
+> [Limitations of mode 3](#limitations-of-mode-3).
 
 Modes 1 and 2 answer "is this the same audio?" and "is this the same rig?".
 Mode 3 answers a third question: **which other files captured this same stretch
@@ -405,6 +416,14 @@ On top of that, lags overlapping by less than
 The output reports both numbers — `envelope r=+0.89 … (scored +0.81 over a
 300s overlap)` — so you can always see what the penalty did.
 
+**What the penalty does not do is make a short overlap safe.** Both terms are
+gentle by design — they exist to move the argmax off the edges, not to be a
+significance test — and by five minutes the absolute term is already at 0.91,
+so it is barely discounting anything. Unrelated files still reach 0.838 there.
+That is handled where it belongs, in [the verdict](#the-verdict), by requiring
+20 minutes of overlap before the envelope is allowed to claim a pair on its
+own.
+
 ### Evidence 2 — constellation coherence (confirming)
 
 For the top envelope candidates, mode 3 also runs the mode-1 landmark search,
@@ -454,14 +473,58 @@ recorder with different microphones may share no usable landmarks at all. So:
 
 | Verdict | Requires |
 | --- | --- |
-| **PAIR** | score ≥ 0.80, **or** coherence `strong` with score ≥ 0.65 |
-| **LIKELY PAIR** | score ≥ 0.65 |
+| **PAIR** | score ≥ 0.80 **over ≥ 20 minutes of overlap**, **or** coherence `strong` with score ≥ 0.65 |
+| **TIMELINE MATCH** | score ≥ 0.65 (loudness timelines align; unconfirmed — could be any capture of the same event) |
 | weak | anything below |
 
 Two routes to PAIR, because one rig and two rigs leave different evidence.
 Coherence `strong` (≥ 30 aligned votes at ≥ 4× sharpness) essentially cannot
-happen by chance, so it promotes a merely-plausible envelope score; but it can
-never rescue an envelope that disagrees about the timeline.
+happen by chance, so it promotes a merely-plausible envelope score at any
+length; but it can never rescue an envelope that disagrees about the timeline.
+
+> **Seed pair mode with whole files, or at least twenty minutes.** Below that
+> the envelope alone cannot print PAIR, however high it scores, and the output
+> says so on every hit it holds back. Below **five** minutes it is unreliable
+> in both directions and says so even louder — see
+> [Limitations of mode 3](#limitations-of-mode-3).
+
+**Why the length condition exists.** The envelope is the only evidence here
+that always fires, and nothing can contradict it: coherence confirms a high
+score or stays silent, and the session score and segment lines are supporting
+evidence that follow the alignment rather than test it. So a wrong envelope
+number is a wrong verdict, full stop — which is fine only while unrelated files
+score nowhere near 0.80. Over ~15 000–22 000 genuine negative pairs
+(non-overlapping excerpts cut from this corpus: the same band, the same room,
+often the same recorder on both sides) they do not:
+
+| overlap | negative-score ceiling | true pairs at that length |
+| --- | ---: | --- |
+| 5 min | **0.838** (18 pairs ≥ 0.80) | 20 of 90 fell *below* 0.80 |
+| 10 min | **0.810** | |
+| 15 min | **0.804** | |
+| 20 min | 0.696 | |
+| 30 min | 0.568 | |
+| whole files | 0.584 | 0.887 … 0.937 |
+
+At five minutes the two distributions overlap outright — unrelated recordings
+reach higher than a fifth of the *true* pairs do. The overlap penalty is
+supposed to be preventing exactly this and has stopped: `sqrt(L / (L + 60 s))`
+is 0.91 at five minutes and 0.98 at twenty, so past the first few minutes it
+discounts essentially nothing, while the relative term is 1 at every lag that
+uses all the overlap there is. Two five-minute excerpts, each shrunk to its own
+loud middle, really do correlate at 0.84.
+
+Twenty minutes is where the measured negatives fall back below the bar with
+0.10 to spare, so that is
+`PAIR_ENVELOPE_TRUST_OVERLAP_SECONDS = 1200`. Below it the envelope alone tops
+out at TIMELINE MATCH; strong coherence still lifts a hit to PAIR at any
+length, because that is a genuinely independent second measurement and the one
+thing the gate is asking for. A ten-minute S12/S34 excerpt pair, which is what
+the test suite runs on, is still PAIR for that reason.
+
+The thresholds themselves (0.80 / 0.65) are unchanged and are still the
+long-overlap numbers: on whole files the hardest available negatives reach
+0.584 against true pairs at 0.887 … 0.937, a gap 0.30 wide.
 
 Candidates are *generated* by envelope score alone — everything is correlated,
 and everything that will be reported (at least the top 20) gets the coherence
@@ -471,17 +534,15 @@ fall on a drifting line with the seed is as close to proof as this tool gets,
 and burying it under a slightly higher envelope score with nothing behind it
 would be the wrong way round.
 
-The thresholds come from the measurements above. The unrelated set is the
-*hardest* negative class available — the same band, the same recorder, the same
-room, sets of similar length and shape on different days — so its 0.584 ceiling
-is realistic rather than flattering. LIKELY PAIR at 0.65 clears it; PAIR at
-0.80 sits in the empty middle of a gap 0.30 wide.
-
-**LIKELY PAIR is the honest verdict for a different-recorder capture**, and is
-not a lesser result. The test suite's simulated second rig (+104 ppm resample,
-−6 dB below 200 Hz, +3 dB above 4 kHz, an echo, −6 dB gain, 128 kbps mp3)
-scores **0.871** on the envelope (raw r 0.913) at exactly the right lag, with
-the runner-up at 0.407.
+**TIMELINE MATCH is the honest verdict for a different-recorder capture**, and
+is not a failure: it says the two files were rolling at the same time, which is
+the question this mode was built to answer. It stops short of "these are two
+angles on one recording" because from a loudness envelope alone, over anything
+less than a long overlap, nobody can tell. The test suite's simulated second
+rig (+104 ppm resample, −6 dB below 200 Hz, +3 dB above 4 kHz, an echo, −6 dB
+gain, 128 kbps mp3) scores **0.871** on the envelope (raw r 0.913) at exactly
+the right lag, with the runner-up at 0.407 — and comes out PAIR because its
+coherence survives the mangling.
 
 ### What the output says
 
@@ -495,7 +556,12 @@ seed: .../seeds/TASCAM_0077S34.wav
 seed length: 10:00.0
 seed filename parsed as Tascam take 0077 S34
 
- 1. [   PAIR    ] .../lib/TASCAM_0077S12.wav
+  short seed (10:00.0): envelope-only verdicts are capped at TIMELINE MATCH
+  below 20 minutes of overlap, because unrelated recordings score as high as
+  0.84 over an overlap this short.  For full confidence seed with the whole
+  file (or at least 20 minutes).
+
+ 1. [     PAIR     ] .../lib/TASCAM_0077S12.wav
       length 10:00.0; the seed's 0:00 lands at 0:00.0 in this file
       - envelope r=+0.93 at lag +0s (scored +0.88 over a 600s overlap)
       - acoustic coherence: strong (289 aligned landmark votes, 26.3x
@@ -506,7 +572,7 @@ seed filename parsed as Tascam take 0077 S34
       - segments align: 8/8 boundaries within +/-4s (4 active stretch(es) in
         the seed, 4 in this file)
 
- 2. [   weak    ] .../lib/pakDR40_S12.wav
+ 2. [     weak     ] .../lib/pakDR40_S12.wav
       length 10:00.0; the seed's 0:00 lands at -3:23.0 in this file
       - envelope r=+0.55 at lag -203s (scored +0.42 over a 397s overlap)
       - acoustic coherence: none -- consistent with a capture on different
@@ -521,9 +587,62 @@ lag that only overlaps by 397 of the available 600 seconds, penalised to 0.42 �
 and 2 of 5 track boundaries lining up, which is what "no relationship" looks
 like next to the winner's 8 of 8.
 
+The seed here is a ten-minute excerpt, so the header warns that nothing in this
+run can reach PAIR on the envelope alone. The winner does anyway, because it is
+the same recorder's other microphone pair and its coherence is strong.
+
 Take numbers and the mode-2 session score appear as **supporting evidence
 lines, never as gates** — `pakDR40_S12.wav` has no parseable take number at all
 and still wins its own query on the audio.
+
+**And here is the same output when the envelope is all there is.** The seed is
+the first five minutes of `pakDR40_S34`; the library holds ten minutes of
+`pakDR40_earlier`, a different recording from a different part of the same
+card, which shares no audio and no wall-clock time with it at all:
+
+```
+ 1. [TIMELINE MATCH] .../lib/pakDR40_earlier_15-25.wav
+      length 10:00.0; the seed's 0:00 lands at 0:24.0 in this file
+      - envelope r=+0.94 at lag +24s (scored +0.86 over a 300s overlap)
+      - acoustic coherence: none -- consistent with a capture on different
+        equipment (or with no shared audio at all)
+      - short overlap (300s): envelope-only verdicts are capped at TIMELINE
+        MATCH below 1200s, because unrelated recordings score this high over
+        an overlap this short; for full confidence seed with the whole file
+      - session signature: 0.67 (mode 2's score, as supporting evidence only)
+      - segments align: 1/4 boundaries within +/-4s (2 active stretch(es) in
+        the seed, 2 in this file)
+```
+
+`r = +0.94` on 300 seconds of two unrelated recordings, and every supporting
+line goes along with it — the session score is 0.67 because it *is* the same
+recorder, and only the segment line dissents. Before the length gate this
+printed `[PAIR]`. It is now the mode's regression test.
+
+Under five minutes the header is blunter still, because at that length the
+mode fails in both directions at once:
+
+```
+  VERY SHORT SEED (1:52.0): below 5 minutes this mode is unreliable in
+  BOTH directions.  Measured against known ground truth: a 61-second seed
+  scored r = -0.52 against its own true dual-record mate and ranked it 15th
+  of 16; a 112-second seed returned seven mutually contradictory matches
+  against unrelated files.  Treat everything below as a lead, not a finding,
+  and re-run with the whole file -- which is what this mode is for.
+```
+
+One more line you may see, on hits the gate does *not* hold back:
+
+```
+      - note: no shared-clock evidence despite a long overlap -- expected for
+        different-recorder captures; suspicious if these files should share a
+        recorder
+```
+
+That is informational and never changes the verdict. A long, high-scoring
+envelope match with no landmarks in common is the normal signature of a second
+recorder — and also what a supposed dual-record S12/S34 pair would look like if
+the two files were not in fact from one machine.
 
 ### The segment view
 
@@ -551,8 +670,13 @@ audio-match backfill                     # or --db PATH, --workers N
 ```
 
 Backfill decodes only the rows whose envelope is missing, and computes only the
-envelope — no STFT, no peak picking, no hashing — which makes it roughly three
-times cheaper per byte than indexing. It writes one column with a targeted
+envelope — no STFT, no peak picking, no hashing. That is **~1.9× cheaper in
+CPU** per byte than indexing, measured, and in practice you should not expect
+it to be much faster in wall clock: both passes have to read every byte of
+every file off the disk, and on a library this size the disk is the bottleneck,
+not the arithmetic. **Budget roughly the same wall clock as the original
+indexing run** for a full-library backfill. It writes one column with a
+targeted
 `UPDATE`: landmarks, signatures, sizes and mtimes come out byte-identical.
 Like `index`, it is resumable — the work list is "rows with no envelope", which
 shrinks as the run commits — and a file whose size or mtime no longer matches
@@ -577,7 +701,36 @@ Files indexed after this change always get an envelope; `stats`, `index` and
 * **Below a minute of seed it refuses.** At 1 Hz, a 30-second seed is 30
   numbers; correlated against a few hundred candidate lags, r > 0.8 happens by
   chance routinely. Pair mode says so rather than reporting a number it does
-  not believe. Ten minutes or more is comfortable.
+  not believe. That 60-second bar is a *rejection* floor, not a recommendation
+  — see the next two bullets for what it is like just above it.
+* **One- and two-minute seeds are unreliable in BOTH directions**, and this is
+  the sharpest limitation in the tool. Measured against human-made alignment
+  ground truth on a five-recorder live set:
+  * a **61-second** seed scored `r = -0.52` against its own true dual-record
+    mate *at the correct lag* — a **negative** correlation between two
+    microphone pairs on one machine — and ranked it **15th of 16**;
+  * a **112-second** seed produced **seven** confident-looking timeline
+    matches against unrelated hour-long files, at implied lags spanning
+    919 s … 2473 s. No arrangement of recordings can satisfy all seven, so at
+    least six were wrong; the seed's true mate came **14th**.
+
+  So a short seed does not merely fail to confirm — it invents matches and
+  loses real ones at the same time. Every hit under five minutes of overlap
+  says so on its own line, and the run says so again in its header, but the
+  only real fix is length. **Five minutes is the practical floor; whole files
+  are what this mode is for.**
+* **Between five minutes and twenty, it will not say PAIR on the envelope
+  alone.** A ten-minute excerpt produces a perfectly well-behaved correlation
+  that is simply not decisive: the measured negatives reach 0.810 there. Those
+  hits are capped at TIMELINE MATCH, and each one prints the reason and the
+  remedy. Strong coherence still lifts them to PAIR, which is how the DR-40's
+  own S12/S34 pairs come out right on ten-minute excerpts.
+* **Full-length seeds are a different animal, and they work.** The same
+  five-recorder validation, seeded with whole 62–65 minute files across four
+  DR-40s and one other machine, returned **50 of 53 pairs as PAIR**, every one
+  coherence-confirmed, with a worst-case envelope lag error of **0.47 s**
+  against the hand-made ground truth. Length is the one input that improves
+  every number in this mode at once.
 * **Silence has no shape.** A file of room tone has a flat envelope and cannot
   be aligned to anything; mode 3 reports that rather than correlating noise.
 * **Drift beyond ±300 ppm is not searched**, and drift is not measurable at all
@@ -587,14 +740,18 @@ Files indexed after this change always get an envelope; `stats`, `index` and
   only where the loudness *changes*; a continuous, evenly-loud 45 minutes gives
   the correlation little to hold on to. Sets with gaps between numbers are the
   easy case, and are also the normal one.
-* **The thresholds are calibrated on four sessions, not four hundred.** The
-  gap between true pairs and unrelated ones is wide (0.887 … 0.937 against
-  0.402 … 0.584 on whole files), but the *closest* negative measured — two
-  different sessions by the same band, compared over ten-minute excerpts —
-  reached 0.620 against a LIKELY PAIR bar of 0.65. That 0.03 is the thinnest
-  margin anywhere in this mode, and it is on excerpts rather than whole files.
-  Seed with as much of the recording as you have; the separation improves with
-  length, and it is what the numbers above were measured on.
+* **The thresholds are calibrated on one band's four sessions, not four
+  hundred.** On whole files the gap is wide — 0.887 … 0.937 for true pairs
+  against 0.402 … 0.584 for the hardest available negatives — and that is the
+  regime the 0.80 and 0.65 bars are honest in. It is also the *only* regime
+  they are honest in: over short overlaps the negative ceiling climbs to 0.838
+  and the two distributions overlap, which is what the length gate is for (see
+  [The verdict](#the-verdict)). A different band, a different room or a
+  different kind of material could move these numbers again, and there is no
+  substitute for auditioning the top hit.
+* **TIMELINE MATCH is a *floor* on what the pair could be, not a ceiling.** It
+  means the tool could not confirm more from what it was given. Re-running with
+  longer seeds is usually all it takes.
 * **`--mode both` is deliberately still match + session.** Pair matching is a
   different question with a different answer shape, so it is requested
   explicitly with `--mode pair` rather than bolted onto the default output.
@@ -814,7 +971,7 @@ cannot know what the columns it does not have are supposed to contain.
 
 ```bash
 pip install pytest
-python3 -m pytest tests/          # 115 tests, ~6 minutes warm
+python3 -m pytest tests/          # 124 tests, ~8 minutes warm
 ```
 
 The suite runs against the **real** recovered DR-40 corpus in
@@ -831,3 +988,12 @@ Mode 3's tests are the expensive half, and unavoidably so: the envelope is a
 than the 150 s that is plenty for the constellation. The four ground-truth
 queries share one set of seed analyses (a module-scoped fixture) for that
 reason.
+
+One of them is worth knowing about by name.
+`test_a_short_overlap_cannot_print_pair_on_the_envelope_alone` is the false-
+PAIR repro: five minutes of `pakDR40_S34` against ten minutes of
+`pakDR40_earlier`, two recordings that share no audio and no wall-clock time,
+which correlate at raw `r = +0.94` and once printed `[PAIR]`. It asserts both
+halves — that the score really is still that high, so the test keeps
+exercising the gate, and that the verdict is TIMELINE MATCH with the caution
+line attached.

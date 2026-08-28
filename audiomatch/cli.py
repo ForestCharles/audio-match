@@ -158,10 +158,40 @@ def print_pair_results(res: QueryResult, out=None) -> None:
     if not res.pairs:
         w("\n  no candidates.\n")
         return
+    # The overlap can never exceed the seed, so a short seed caps every verdict
+    # in this run before a single candidate is looked at.  Say so once, at the
+    # top, rather than only on whichever hits happen to bump into the gate.
+    trust_minutes = config.PAIR_ENVELOPE_TRUST_OVERLAP_SECONDS / 60.0
+    floor_minutes = config.PAIR_UNRELIABLE_OVERLAP_SECONDS / 60.0
+    if res.seed_seconds < config.PAIR_UNRELIABLE_OVERLAP_SECONDS:
+        w("\n" + "\n".join([
+            f"  VERY SHORT SEED ({fmt_clock(res.seed_seconds)}): below "
+            f"{floor_minutes:.0f} minutes this mode is unreliable in",
+            "  BOTH directions.  Measured against known ground truth: a "
+            "61-second seed",
+            "  scored r = -0.52 against its own true dual-record mate and "
+            "ranked it 15th",
+            "  of 16; a 112-second seed returned seven mutually "
+            "contradictory matches",
+            "  against unrelated files.  Treat everything below as a lead, "
+            "not a finding,",
+            "  and re-run with the whole file -- which is what this mode is "
+            "for.",
+        ]) + "\n")
+    elif res.seed_seconds < config.PAIR_ENVELOPE_TRUST_OVERLAP_SECONDS:
+        w("\n" + "\n".join([
+            f"  short seed ({fmt_clock(res.seed_seconds)}): envelope-only "
+            f"verdicts are capped at TIMELINE MATCH",
+            f"  below {trust_minutes:.0f} minutes of overlap, because "
+            f"unrelated recordings score as high as",
+            "  0.84 over an overlap this short.  For full confidence seed "
+            "with the whole",
+            f"  file (or at least {trust_minutes:.0f} minutes).",
+        ]) + "\n")
 
     w("\n")
     for i, h in enumerate(res.pairs, 1):
-        w(f"{i:2d}. [{h.verdict:^11s}] {_short(h.path, 60)}"
+        w(f"{i:2d}. [{h.verdict:^14s}] {_short(h.path, 60)}"
           f"{' [missing]' if h.missing else ''}\n")
         w(f"      length {fmt_clock(h.duration)}; the seed's 0:00 lands at "
           f"{fmt_clock(h.alignment.lag_seconds)} in this file\n")
@@ -181,9 +211,14 @@ def print_pair_results(res: QueryResult, out=None) -> None:
       "  fire when the two files really share audio detail, which in practice\n"
       "  means one recorder (a DR-40 S12/S34 pair) or two very similar mics.\n"
       "  Its absence is NOT evidence against a pair.\n"
-      f"  PAIR needs r >= {config.PAIR_R_STRONG:.2f}, or coherence 'strong' "
-      f"with r >= {config.PAIR_R_LIKELY:.2f}.\n"
-      f"  LIKELY PAIR needs r >= {config.PAIR_R_LIKELY:.2f}.\n"
+      f"  PAIR needs r >= {config.PAIR_R_STRONG:.2f} over at least "
+      f"{trust_minutes:.0f} minutes of overlap, or coherence 'strong'\n"
+      f"  with r >= {config.PAIR_R_LIKELY:.2f}.  Over a shorter overlap the "
+      f"envelope alone cannot print PAIR:\n"
+      "  unrelated recordings of the same band reach 0.84 over five minutes.\n"
+      f"  TIMELINE MATCH needs r >= {config.PAIR_R_LIKELY:.2f} and means the "
+      "loudness timelines align;\n"
+      "  unconfirmed -- it could be any capture of the same event.\n"
       "  Anything that recorded the same hour will match, including a\n"
       "  soundboard feed or somebody else's recorder.  That is usually what\n"
       "  you want; when it is not, the take number and the coherence line\n"
@@ -384,8 +419,11 @@ def build_parser() -> argparse.ArgumentParser:
                          "'both' = those two (the default), 'pair' = other "
                          "files that captured the same session timeline, "
                          "including captures made on entirely different "
-                         "equipment (needs 'audio-match backfill' once on a "
-                         "database built before pair mode existed)")
+                         "equipment; its verdicts are PAIR / TIMELINE MATCH / "
+                         "weak, and PAIR on the loudness envelope alone needs "
+                         "at least 20 minutes of overlap, so seed pair mode "
+                         "with whole files (needs 'audio-match backfill' once "
+                         "on a database built before pair mode existed)")
     pq.add_argument("--top", type=int, default=10,
                     help="results per mode (default: 10)")
     pq.add_argument("--try-rates", action="store_true",

@@ -176,6 +176,67 @@ def pair_corpus() -> PairCorpus:
     return c
 
 
+#: The false-PAIR repro, from the adversarial review of pair mode.
+#:
+#: ``pakDR40_earlier`` is a *different recording* from ``pakDR40_S12/S34`` --
+#: an earlier single-stream take from the same card, with no shared audio at
+#: all -- and these two ranges do not overlap in wall-clock time either.  Yet
+#: the seed's first five minutes correlate with 15:00-25:00 of the earlier file
+#: at raw r = 0.94, scored 0.86 over a 300 s overlap: above ``PAIR_R_STRONG``,
+#: from a pair of files that share nothing.  That is the measurement behind
+#: ``config.PAIR_ENVELOPE_TRUST_OVERLAP_SECONDS``.
+EARLIER_WAV = "pakDR40_earlier.wav"
+FALSE_PAIR_SEED_SECONDS = 300.0
+FALSE_PAIR_LIB_SECONDS = 600.0
+FALSE_PAIR_LIB_START = 900.0
+
+
+def have_earlier() -> bool:
+    return os.path.exists(os.path.join(RECOVERED, EARLIER_WAV))
+
+
+requires_earlier = pytest.mark.skipif(
+    not (have_ffmpeg() and have_corpus() and have_earlier()),
+    reason=f"{EARLIER_WAV} not available in {RECOVERED}")
+
+
+@dataclass
+class FalsePairCorpus:
+    lib: str          # directory holding the one library file
+    seed: str         # the five-minute seed
+
+
+@pytest.fixture(scope="session")
+def false_pair_corpus() -> FalsePairCorpus:
+    """A five-minute seed and a ten-minute library file that share no audio."""
+    if not (have_ffmpeg() and have_corpus() and have_earlier()):
+        pytest.skip("corpus unavailable")
+    root = os.path.join(SCRATCH, "falsepair")
+    c = FalsePairCorpus(
+        lib=os.path.join(root, "lib"),
+        seed=os.path.join(root, "seeds", "pakDR40_S34_0-5.wav"))
+    cut(os.path.join(RECOVERED, EARLIER_WAV),
+        os.path.join(c.lib, "pakDR40_earlier_15-25.wav"),
+        FALSE_PAIR_LIB_START, FALSE_PAIR_LIB_SECONDS)
+    cut(os.path.join(RECOVERED, SESSIONS["pak"][1]), c.seed,
+        0.0, FALSE_PAIR_SEED_SECONDS)
+    return c
+
+
+@pytest.fixture(scope="session")
+def false_pair_db(false_pair_corpus: FalsePairCorpus, tmp_path_factory) -> str:
+    from audiomatch.db import open_db
+    from audiomatch.indexer import run_index
+
+    db_path = str(tmp_path_factory.mktemp("falsepair") / "falsepair.db")
+    with open_db(db_path) as db:
+        summary = run_index(db, false_pair_corpus.lib, workers=2,
+                            progress_stream=None)
+    assert summary["errors"] == 0
+    assert summary["indexed"] == 1
+    return db_path
+
+
 @pytest.fixture(scope="session")
 def pair_db(pair_corpus: PairCorpus, tmp_path_factory) -> str:
     from audiomatch.db import open_db
